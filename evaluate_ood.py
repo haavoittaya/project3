@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 import cv2
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torchvision
@@ -40,6 +41,12 @@ def parse_args() -> argparse.Namespace:
         default="./artifacts",
         help="Directory with stage-1 and stage-2 artifacts.",
     )
+    parser.add_argument(
+        "--reports-dir",
+        type=str,
+        default="./artifacts/reports",
+        help="Directory for evaluation reports (CSV/PNG).",
+    )
     parser.add_argument("--batch-size", type=int, default=256, help="Feature extraction batch size.")
     return parser.parse_args()
 
@@ -49,6 +56,67 @@ def configure_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
+
+
+def compute_risk_coverage(
+    error_labels: np.ndarray,
+    uncertainty_scores: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Compute risk-coverage curve and AURC.
+
+    Lower uncertainty is treated as more confident prediction and retained first.
+    """
+    if error_labels.ndim != 1 or uncertainty_scores.ndim != 1:
+        raise ValueError("error_labels and uncertainty_scores must be 1D arrays")
+    if error_labels.shape[0] != uncertainty_scores.shape[0]:
+        raise ValueError("error_labels and uncertainty_scores must have the same length")
+
+    order = np.argsort(uncertainty_scores)  # keep most confident samples first
+    sorted_errors = error_labels[order].astype(np.float64)
+
+    cumulative_errors = np.cumsum(sorted_errors)
+    ranks = np.arange(1, sorted_errors.shape[0] + 1, dtype=np.float64)
+
+    coverage = ranks / ranks[-1]
+    risk = cumulative_errors / ranks
+    aurc = float(np.mean(risk))
+
+    return coverage, risk, aurc
+
+
+def save_risk_coverage_report(
+    coverage: np.ndarray,
+    risk: np.ndarray,
+    aurc: float,
+    report_prefix: str,
+    reports_dir: Path,
+) -> None:
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    csv_path = reports_dir / f"{report_prefix}_risk_coverage.csv"
+    png_path = reports_dir / f"{report_prefix}_risk_coverage.png"
+
+    report_data = np.column_stack((coverage, risk))
+    np.savetxt(
+        csv_path,
+        report_data,
+        delimiter=",",
+        header="coverage,risk",
+        comments="",
+    )
+
+    plt.figure(figsize=(7, 5))
+    plt.plot(coverage, risk, linewidth=2)
+    plt.xlabel("Coverage")
+    plt.ylabel("Risk")
+    plt.title(f"Risk-Coverage Curve ({report_prefix}, AURC={aurc:.4f})")
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(png_path, dpi=150)
+    plt.close()
+
+    logging.info("Saved risk-coverage report: %s", csv_path)
+    logging.info("Saved risk-coverage plot: %s", png_path)
 
 
 def apply_corruption(images_tensor: torch.Tensor, corruption_type: str, severity: int) -> torch.Tensor:
@@ -109,6 +177,7 @@ def extract_features(dataset, extractor: FeatureExtractor, batch_size: int, devi
 def run_evaluation(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     artifacts_dir = Path(args.artifacts_dir)
+    reports_dir = Path(args.reports_dir)
 
     extractor, mlp = build_models(artifacts_dir, device)
 
@@ -131,8 +200,15 @@ def run_evaluation(args: argparse.Namespace) -> None:
 
     noisy_auroc = roc_auc_score(is_worse_error, -pred_aum)
     noisy_auprc = average_precision_score(is_worse_error, -pred_aum)
+    noisy_coverage, noisy_risk, noisy_aurc = compute_risk_coverage(is_worse_error, -pred_aum)
 
-    logging.info("Noisy label detection (Worse split) | AUROC: %.4f | AUPRC: %.4f", noisy_auroc, noisy_auprc)
+    logging.info(
+        "Noisy label detection (Worse split) | AUROC: %.4f | AUPRC: %.4f | AURC: %.4f",
+        noisy_auroc,
+        noisy_auprc,
+        noisy_aurc,
+    )
+    save_risk_coverage_report(noisy_coverage, noisy_risk, noisy_aurc, "worse_split", reports_dir)
 
     svhn = torchvision.datasets.SVHN(
         root=args.svhn_root,
@@ -153,8 +229,15 @@ def run_evaluation(args: argparse.Namespace) -> None:
 
     ood_auroc = roc_auc_score(ood_labels, ood_confidence)
     ood_auprc = average_precision_score(ood_labels, ood_confidence)
+    ood_coverage, ood_risk, ood_aurc = compute_risk_coverage(ood_labels, ood_confidence)
 
-    logging.info("OOD detection (CIFAR-10 vs SVHN) | AUROC: %.4f | AUPRC: %.4f", ood_auroc, ood_auprc)
+    logging.info(
+        "OOD detection (CIFAR-10 vs SVHN) | AUROC: %.4f | AUPRC: %.4f | AURC: %.4f",
+        ood_auroc,
+        ood_auprc,
+        ood_aurc,
+    )
+    save_risk_coverage_report(ood_coverage, ood_risk, ood_aurc, "ood_cifar10_vs_svhn", reports_dir)
     logging.info("Mean predicted AUM | ID: %.4f | OOD: %.4f", np.mean(id_scores), np.mean(ood_scores))
 
     trainset, _ = setup_cifar10n(data_root=args.data_root, repo_root=args.repo_root)
