@@ -1,34 +1,59 @@
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+from urllib.error import URLError
+from urllib.request import urlretrieve
 
 import torch
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import Dataset
 
-CIFAR10N_REPO_URL = "https://github.com/UCSC-REAL/cifar-10-100n.git"
-CIFAR10N_REPO_DIR = "cifar-10-100n"
-CIFAR10N_LABELS_FILE = Path("data") / "CIFAR-10_human.pt"
-
-
-def _ensure_cifar10n_repo(repo_path: Path) -> None:
-    """Clone the CIFAR-10N metadata repository if it is not available locally."""
-    if repo_path.exists():
-        return
-
-    print("Cloning UCSC-REAL/cifar-10-100n repository...")
-    subprocess.run(
-        ["git", "clone", "--depth", "1", CIFAR10N_REPO_URL, str(repo_path)],
-        check=True,
-    )
+CIFAR10N_LABELS_FILE = Path("CIFAR-10_human.pt")
+CIFAR10N_LABELS_MIRRORS = (
+    "https://cdn.jsdelivr.net/gh/UCSC-REAL/cifar-10-100n@master/data/CIFAR-10_human.pt",
+    "https://raw.githubusercontent.com/UCSC-REAL/cifar-10-100n/master/data/CIFAR-10_human.pt",
+)
 
 
 def _default_transform() -> transforms.Compose:
     """Return the default preprocessing pipeline for CIFAR-10 samples."""
     return transforms.Compose([transforms.ToTensor()])
+
+
+def _ensure_cifar10n_labels(data_root: Path, repo_root: Optional[Path]) -> Path:
+    """Ensure that the CIFAR-10N label file is available locally.
+
+    The function first checks a user-provided repository path, then the data root,
+    and finally downloads only the required `CIFAR-10_human.pt` artifact from a
+    faster mirror instead of cloning the full repository.
+    """
+    candidate_paths = []
+    if repo_root is not None:
+        candidate_paths.append(repo_root / "data" / CIFAR10N_LABELS_FILE.name)
+    candidate_paths.append(data_root / CIFAR10N_LABELS_FILE.name)
+
+    for candidate in candidate_paths:
+        if candidate.exists():
+            return candidate
+
+    data_root.mkdir(parents=True, exist_ok=True)
+    target_path = data_root / CIFAR10N_LABELS_FILE.name
+
+    last_error: Optional[Exception] = None
+    for url in CIFAR10N_LABELS_MIRRORS:
+        try:
+            print(f"Downloading CIFAR-10N labels from {url}...")
+            urlretrieve(url, target_path)
+            return target_path
+        except (URLError, OSError, ValueError) as exc:
+            last_error = exc
+
+    raise FileNotFoundError(
+        "Unable to obtain CIFAR-10N labels file from available mirrors. "
+        f"Last error: {last_error}"
+    )
 
 
 def setup_cifar10n(
@@ -49,17 +74,14 @@ def setup_cifar10n(
         1) CIFAR-10 training dataset.
         2) Dictionary with CIFAR-10N human/noise labels and metadata.
     """
-    repo_path = Path(repo_root) if repo_root else Path(CIFAR10N_REPO_DIR)
-    _ensure_cifar10n_repo(repo_path)
-
-    labels_path = repo_path / CIFAR10N_LABELS_FILE
-    if not labels_path.exists():
-        raise FileNotFoundError(f"CIFAR-10N labels file not found: {labels_path}")
+    data_path = Path(data_root)
+    repo_path = Path(repo_root) if repo_root else None
+    labels_path = _ensure_cifar10n_labels(data_path, repo_path)
 
     noise_data: Dict[str, Any] = torch.load(labels_path, weights_only=False)
     dataset_transform = transform or _default_transform()
     trainset = torchvision.datasets.CIFAR10(
-        root=data_root,
+        root=data_path,
         train=True,
         download=True,
         transform=dataset_transform,

@@ -21,7 +21,7 @@ pip install -r requirements.txt
 ## Data and Artifacts
 
 - CIFAR-10 is downloaded automatically via torchvision.
-- CIFAR-10N metadata is cloned automatically from `UCSC-REAL/cifar-10-100n`.
+- CIFAR-10N metadata is downloaded automatically as a single `CIFAR-10_human.pt` file from a fast mirror, instead of cloning the full repository.
 - Stage outputs are saved to `./artifacts` by default.
 
 Expected artifacts after full run:
