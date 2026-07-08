@@ -196,7 +196,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
         id_preds = mlp(torch.from_numpy(x_features).to(device)).cpu().numpy()
 
     pred_aum = id_preds[:, 0]
-    is_worse_error = (noise_data["worse_label"] != noise_data["clean_label"]).numpy().astype(np.int32)
+    is_worse_error = (noise_data["worse_label"] != noise_data["clean_label"]).astype(np.int32)
 
     noisy_auroc = roc_auc_score(is_worse_error, -pred_aum)
     noisy_auprc = average_precision_score(is_worse_error, -pred_aum)
