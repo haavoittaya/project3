@@ -7,8 +7,8 @@ This repository implements a two-stage pipeline for distilling training dynamics
 - `src/models.py`: network components (ResNet-18 backbone, feature extractor, MLP head)
 - `src/dataset.py`: CIFAR-10/CIFAR-10N data setup and repository bootstrap
 - `train_stage1.py`: trajectory tracking and backbone training
-- `train_stage2.py`: descriptor target construction and MLP distillation
-- `evaluate_ood.py`: noisy-label, OOD, and robustness evaluation
+- `train_stage2.py`: full trajectory distillation with TrajectoryGenerator
+- `evaluate_ood.py`: OOD-centric evaluation across clean ID, noisy ID, near-OOD, and far-OOD groups
 - `train_stage1_cifar100n.py`: CIFAR-100N trajectory tracking and backbone training
 - `train_stage2_cifar100n.py`: CIFAR-100N descriptor distillation
 - `evaluate_ood_cifar100n.py`: CIFAR-100N noisy-label, OOD, and robustness evaluation
@@ -33,18 +33,18 @@ Expected artifacts after full run:
 - `artifacts/softmax_history_cifar10n.npy`
 - `artifacts/margin_history_cifar10n.npy`
 - `artifacts/resnet18_backbone.pth`
-- `artifacts/mlp_4d_cifar10n.pth`
-- `artifacts/X_features.npy`
-- `artifacts/Y_targets_4d.npy`
+- `artifacts/trajectory_generator.pth`
+- `artifacts/X_features_cifar10n.npy`
+- `artifacts/trajectory_targets_cifar10n_margin.npy`
 
 Expected artifacts for CIFAR-100N pipeline (default `./artifacts_cifar100n`):
 
 - `artifacts_cifar100n/softmax_history_cifar100n.npy`
 - `artifacts_cifar100n/margin_history_cifar100n.npy`
 - `artifacts_cifar100n/resnet18_backbone_cifar100n.pth`
-- `artifacts_cifar100n/mlp_4d_cifar100n.pth`
+- `artifacts_cifar100n/trajectory_generator.pth`
 - `artifacts_cifar100n/X_features_cifar100n.npy`
-- `artifacts_cifar100n/Y_targets_4d_cifar100n.npy`
+- `artifacts_cifar100n/trajectory_targets_cifar100n_margin.npy`
 
 ## Unified Pipeline (Single Scripts)
 
@@ -97,20 +97,12 @@ Train the backbone on CIFAR-10N aggregate labels and store trajectory statistics
 python train_stage1.py --epochs 50 --batch-size 256 --lr 0.001 --seed 42
 ```
 
-## Stage 2: Descriptor Distillation
+## Stage 2: Trajectory Distillation
 
-Compute 4D descriptor targets (AUM, mean confidence, confidence variability, forgetting count) and train the MLP head:
+Train a trajectory generator to regress the full epoch-wise margin sequence:
 
 ```powershell
 python train_stage2.py --epochs 40 --batch-size 512 --lr 0.005 --seed 42
-```
-
-## Stage 3: Evaluation
-
-Run evaluation on noisy-label detection, OOD detection (CIFAR-10 vs SVHN), and synthetic corruption robustness:
-
-```powershell
-python evaluate_ood.py --batch-size 256
 ```
 
 ## CIFAR-100N Pipeline
@@ -133,18 +125,39 @@ Evaluation (CIFAR-100N):
 python evaluate_ood_cifar100n.py --batch-size 256
 ```
 
-Reported metrics include:
+## OOD-Centric Evaluation
 
-- AUROC and AUPRC for noisy-label detection
-- AUROC and AUPRC for OOD detection
-- Risk-Coverage based AURC for selective classification behavior
+Run the OOD-centric evaluation with:
 
-Evaluation also exports Risk-Coverage reports to `./artifacts/reports` by default:
+```powershell
+python evaluate_ood.py --dataset cifar10n --batch-size 256
+python evaluate_ood.py --dataset cifar100n --batch-size 256
+```
 
-- `worse_split_risk_coverage.csv`
-- `worse_split_risk_coverage.png`
-- `ood_cifar10_vs_svhn_risk_coverage.csv`
-- `ood_cifar10_vs_svhn_risk_coverage.png`
+The main evaluation script now uses four groups for the selected ID dataset:
+
+- Clean ID: test split with correct labels
+- Noisy ID: noisy training subset with human-flipped labels
+- Near-OOD: CIFAR-100 when ID is CIFAR-10, and CIFAR-10 when ID is CIFAR-100
+- Far-OOD: SVHN test split
+
+It compares four scoring methods:
+
+- Maximum Softmax Probability (MSP)
+- LogitNorm + MSP or Energy
+- Mahalanobis distance
+- Trajectory prediction score from `TrajectoryGenerator`
+
+Evaluation reports AUROC, AUPRC, and AURC for these binary tasks:
+
+- Clean ID vs Noisy ID
+- Clean ID vs Near-OOD
+- Clean ID vs Far-OOD
+
+The script also writes a summary CSV to the reports directory, for example:
+
+- `artifacts/reports/ood_summary_cifar10n.csv`
+- `artifacts_cifar100n/reports/ood_summary_cifar100n.csv`
 
 ## Optional Paths
 
@@ -155,6 +168,10 @@ You can override default paths in all scripts:
 - `--artifacts-dir` for saved artifacts
 - `--svhn-root` in `evaluate_ood.py`
 - `--reports-dir` in `evaluate_ood.py`
+
+## Evaluation Note
+
+The comparison is intended to assess whether trajectory prediction contributes complementary information relative to standard confidence- and distance-based baselines. It does not assume unconditional superiority of any single method.
 
 ## Reproducibility Notes
 

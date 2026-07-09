@@ -13,7 +13,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.dataset import setup_cifar100n, setup_cifar10n
-from src.models import AdvancedMLP, FeatureExtractor, get_resnet18_backbone
+from src.models import FeatureExtractor, TrajectoryGenerator, get_resnet18_backbone
 
 DATASET_CONFIG: Dict[str, Dict[str, Any]] = {
     "cifar10n": {
@@ -23,9 +23,9 @@ DATASET_CONFIG: Dict[str, Dict[str, Any]] = {
         "margin_file": "margin_history_cifar10n.npy",
         "softmax_file": "softmax_history_cifar10n.npy",
         "backbone_file": "resnet18_backbone.pth",
-        "mlp_file": "mlp_4d_cifar10n.pth",
-        "features_file": "X_features.npy",
-        "targets_file": "Y_targets_4d.npy",
+        "trajectory_file": "trajectory_generator.pth",
+        "features_file": "X_features_cifar10n.npy",
+        "targets_file": "trajectory_targets_cifar10n.npy",
         "setup_fn": setup_cifar10n,
     },
     "cifar100n": {
@@ -35,9 +35,9 @@ DATASET_CONFIG: Dict[str, Dict[str, Any]] = {
         "margin_file": "margin_history_cifar100n.npy",
         "softmax_file": "softmax_history_cifar100n.npy",
         "backbone_file": "resnet18_backbone_cifar100n.pth",
-        "mlp_file": "mlp_4d_cifar100n.pth",
+        "trajectory_file": "trajectory_generator.pth",
         "features_file": "X_features_cifar100n.npy",
-        "targets_file": "Y_targets_4d_cifar100n.npy",
+        "targets_file": "trajectory_targets_cifar100n.npy",
         "setup_fn": setup_cifar100n,
     },
 }
@@ -45,7 +45,7 @@ DATASET_CONFIG: Dict[str, Dict[str, Any]] = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Stage 2: distill training dynamics into a descriptor MLP for CIFAR-10N/CIFAR-100N."
+        description="Stage 2: distill full training trajectories with a TrajectoryGenerator for CIFAR-10N/CIFAR-100N."
     )
     parser.add_argument(
         "--dataset",
@@ -55,8 +55,15 @@ def parse_args() -> argparse.Namespace:
         help="Dataset/noise benchmark to use.",
     )
     parser.add_argument("--batch-size", type=int, default=512, help="Stage-2 batch size.")
-    parser.add_argument("--epochs", type=int, default=40, help="Number of MLP training epochs.")
-    parser.add_argument("--lr", type=float, default=5e-3, help="Learning rate for MLP optimizer.")
+    parser.add_argument("--epochs", type=int, default=40, help="Number of trajectory distillation epochs.")
+    parser.add_argument("--lr", type=float, default=5e-3, help="Learning rate for the trajectory generator.")
+    parser.add_argument(
+        "--loss",
+        type=str,
+        choices=("smooth_l1", "mse"),
+        default="smooth_l1",
+        help="Loss function for trajectory regression.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Global random seed.")
     parser.add_argument("--data-root", type=str, default="./data", help="Dataset directory.")
     parser.add_argument(
@@ -77,6 +84,43 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional label key from noise metadata (auto-selected by dataset if omitted).",
     )
+    parser.add_argument(
+        "--target-type",
+        type=str,
+        choices=("margin", "softmax"),
+        default="margin",
+        help="Full trajectory target to distill.",
+    )
+    parser.add_argument(
+        "--sequence-length",
+        type=int,
+        default=50,
+        help="Expected trajectory length / number of training epochs.",
+    )
+    parser.add_argument(
+        "--hidden-dim",
+        type=int,
+        default=256,
+        help="Hidden size used inside the trajectory generator.",
+    )
+    parser.add_argument(
+        "--temporal-dim",
+        type=int,
+        default=128,
+        help="Internal temporal width used by the trajectory generator.",
+    )
+    parser.add_argument(
+        "--num-residual-blocks",
+        type=int,
+        default=3,
+        help="Number of residual MLP blocks inside the trajectory generator.",
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.1,
+        help="Dropout rate used inside the trajectory generator.",
+    )
     return parser.parse_args()
 
 
@@ -95,26 +139,32 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def compute_descriptors(
+def load_trajectory_targets(
+    target_type: str,
     margin_history: np.ndarray,
     softmax_history: np.ndarray,
     noisy_labels: np.ndarray,
 ) -> np.ndarray:
-    num_samples = softmax_history.shape[1]
-    aum_arr = np.mean(margin_history, axis=0)
-    mean_conf_arr = np.zeros(num_samples, dtype=np.float32)
-    var_arr = np.zeros(num_samples, dtype=np.float32)
-    forget_arr = np.zeros(num_samples, dtype=np.float32)
+    """Load a full trajectory target in sample-major format [N, T]."""
+    if margin_history.ndim != 2:
+        raise ValueError("margin_history must have shape [T, N] or [N, T]")
+    if softmax_history.ndim != 3:
+        raise ValueError("softmax_history must have shape [T, N, C]")
 
-    logging.info("Computing descriptor targets for %d samples", num_samples)
-    for i in range(num_samples):
-        true_conf = softmax_history[:, i, noisy_labels[i]]
-        mean_conf_arr[i] = np.mean(true_conf)
-        var_arr[i] = np.std(true_conf)
-        predictions = true_conf > 0.5
-        forget_arr[i] = np.sum(predictions[:-1] & (~predictions[1:]))
+    if target_type == "margin":
+        targets = margin_history
+        if targets.shape[0] < targets.shape[1]:
+            targets = targets.T
+        return targets.astype(np.float32)
 
-    return np.column_stack((aum_arr, mean_conf_arr, var_arr, forget_arr)).astype(np.float32)
+    if target_type == "softmax":
+        if softmax_history.shape[1] != noisy_labels.shape[0]:
+            raise ValueError("softmax_history sample dimension and noisy_labels length must match")
+        sample_indices = np.arange(noisy_labels.shape[0])
+        trajectory = softmax_history[:, sample_indices, noisy_labels].T
+        return trajectory.astype(np.float32)
+
+    raise ValueError(f"Unsupported target_type: {target_type}")
 
 
 def extract_features(
@@ -169,51 +219,84 @@ def train_stage2(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
         raise KeyError(f"Label key '{label_key}' not found. Available keys: {list(noise_data.keys())}")
     noisy_labels = np.array(noise_data[label_key]).astype(np.int64)
 
-    descriptor_targets = compute_descriptors(margin_history, softmax_history, noisy_labels)
+    trajectory_targets = load_trajectory_targets(args.target_type, margin_history, softmax_history, noisy_labels)
+    if trajectory_targets.shape[1] != args.sequence_length:
+        raise ValueError(
+            f"Expected trajectory length {args.sequence_length}, but got {trajectory_targets.shape[1]}. "
+            "Check stage-1 epoch count or sequence_length."
+        )
+
     feature_matrix = extract_features(trainset, backbone_path, int(config["num_classes"]), device)
+    if feature_matrix.shape[0] != trajectory_targets.shape[0]:
+        raise ValueError(
+            f"Feature count {feature_matrix.shape[0]} does not match trajectory target count {trajectory_targets.shape[0]}."
+        )
 
-    mlp_dataset = TensorDataset(
+    trajectory_dataset = TensorDataset(
         torch.from_numpy(feature_matrix),
-        torch.from_numpy(descriptor_targets),
+        torch.from_numpy(trajectory_targets),
     )
-    mlp_loader = DataLoader(mlp_dataset, batch_size=args.batch_size, shuffle=True)
+    trajectory_loader = DataLoader(trajectory_dataset, batch_size=args.batch_size, shuffle=True)
 
-    mlp = AdvancedMLP().to(device)
-    criterion = nn.SmoothL1Loss()
-    optimizer = optim.Adam(mlp.parameters(), lr=args.lr)
+    generator = TrajectoryGenerator(
+        input_dim=feature_matrix.shape[1],
+        sequence_length=args.sequence_length,
+        hidden_dim=args.hidden_dim,
+        temporal_dim=args.temporal_dim,
+        num_residual_blocks=args.num_residual_blocks,
+        dropout=args.dropout,
+        output_channels=1,
+        use_logit_norm=False,
+    ).to(device)
 
-    logging.info("Stage 2 started: dataset=%s, epochs=%d, label_key=%s", args.dataset, args.epochs, label_key)
+    criterion: nn.Module
+    if args.loss == "mse":
+        criterion = nn.MSELoss()
+    else:
+        criterion = nn.SmoothL1Loss()
+
+    optimizer = optim.Adam(generator.parameters(), lr=args.lr)
+
+    logging.info(
+        "Stage 2 started: dataset=%s, epochs=%d, target_type=%s, label_key=%s, sequence_length=%d",
+        args.dataset,
+        args.epochs,
+        args.target_type,
+        label_key,
+        args.sequence_length,
+    )
     for epoch in range(args.epochs):
-        mlp.train()
+        generator.train()
         epoch_loss = 0.0
 
-        for batch_x, batch_y in mlp_loader:
+        for batch_x, batch_y in trajectory_loader:
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
 
             optimizer.zero_grad(set_to_none=True)
-            predictions = mlp(batch_x)
+            predictions = generator(batch_x)
             loss = criterion(predictions, batch_y)
             loss.backward()
             optimizer.step()
 
             epoch_loss += loss.item()
 
-        avg_loss = epoch_loss / max(1, len(mlp_loader))
+        avg_loss = epoch_loss / max(1, len(trajectory_loader))
         logging.info("Epoch %d/%d | loss=%.6f", epoch + 1, args.epochs, avg_loss)
 
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-    mlp_path = artifacts_dir / str(config["mlp_file"])
+    trajectory_path = artifacts_dir / str(config["trajectory_file"])
     features_path = artifacts_dir / str(config["features_file"])
-    targets_path = artifacts_dir / str(config["targets_file"])
+    targets_name = f"{Path(str(config['targets_file'])).stem}_{args.target_type}.npy"
+    targets_path = artifacts_dir / targets_name
 
-    torch.save(mlp.state_dict(), mlp_path)
+    torch.save(generator.state_dict(), trajectory_path)
     np.save(features_path, feature_matrix)
-    np.save(targets_path, descriptor_targets)
+    np.save(targets_path, trajectory_targets)
 
     logging.info("Stage 2 artifacts saved to %s", artifacts_dir.resolve())
-    return mlp_path, features_path, targets_path
+    return trajectory_path, features_path, targets_path
 
 
 def main() -> None:
