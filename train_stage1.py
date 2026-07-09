@@ -4,7 +4,7 @@ import argparse
 import logging
 import random
 from pathlib import Path
-from typing import Tuple
+from typing import Any, Dict, Tuple
 
 import numpy as np
 import torch
@@ -13,19 +13,47 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from src.dataset import setup_cifar10n
+from src.dataset import setup_cifar100n, setup_cifar10n
 from src.models import get_resnet18_backbone
+
+DATASET_CONFIG: Dict[str, Dict[str, Any]] = {
+    "cifar10n": {
+        "num_classes": 10,
+        "default_label_key": "aggre_label",
+        "default_output_dir": "./artifacts",
+        "softmax_file": "softmax_history_cifar10n.npy",
+        "margin_file": "margin_history_cifar10n.npy",
+        "backbone_file": "resnet18_backbone.pth",
+        "setup_fn": setup_cifar10n,
+    },
+    "cifar100n": {
+        "num_classes": 100,
+        "default_label_key": "noisy_label",
+        "default_output_dir": "./artifacts_cifar100n",
+        "softmax_file": "softmax_history_cifar100n.npy",
+        "margin_file": "margin_history_cifar100n.npy",
+        "backbone_file": "resnet18_backbone_cifar100n.pth",
+        "setup_fn": setup_cifar100n,
+    },
+}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Stage 1: train backbone and track per-sample dynamics on CIFAR-10N."
+        description="Stage 1: train backbone and track per-sample dynamics on CIFAR-10N/CIFAR-100N."
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=("cifar10n", "cifar100n"),
+        default="cifar10n",
+        help="Dataset/noise benchmark to use.",
     )
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs.")
     parser.add_argument("--batch-size", type=int, default=256, help="Training batch size.")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate for Adam.")
     parser.add_argument("--seed", type=int, default=42, help="Global random seed.")
-    parser.add_argument("--data-root", type=str, default="./data", help="CIFAR-10 data directory.")
+    parser.add_argument("--data-root", type=str, default="./data", help="Dataset directory.")
     parser.add_argument(
         "--repo-root",
         type=str,
@@ -33,10 +61,16 @@ def parse_args() -> argparse.Namespace:
         help="Optional path to local cifar-10-100n repository.",
     )
     parser.add_argument(
+        "--label-key",
+        type=str,
+        default=None,
+        help="Optional label key from noise metadata (auto-selected by dataset if omitted).",
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
-        default="./artifacts",
-        help="Directory to store stage-1 outputs.",
+        default=None,
+        help="Directory to store stage-1 outputs (auto-selected by dataset if omitted).",
     )
     return parser.parse_args()
 
@@ -72,12 +106,18 @@ def train_stage1(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_seed(args.seed)
 
-    trainset, noise_data = setup_cifar10n(data_root=args.data_root, repo_root=args.repo_root)
-    trainset.targets = noise_data["aggre_label"].tolist()
+    config = DATASET_CONFIG[args.dataset]
+    label_key = args.label_key or config["default_label_key"]
+    setup_fn = config["setup_fn"]
+
+    trainset, noise_data = setup_fn(data_root=args.data_root, repo_root=args.repo_root)
+    if label_key not in noise_data:
+        raise KeyError(f"Label key '{label_key}' not found. Available keys: {list(noise_data.keys())}")
+    trainset.targets = np.array(noise_data[label_key]).tolist()
 
     train_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=False)
     num_samples = len(trainset)
-    num_classes = 10
+    num_classes = int(config["num_classes"])
 
     model = get_resnet18_backbone(num_classes=num_classes).to(device)
     criterion = nn.CrossEntropyLoss()
@@ -86,7 +126,13 @@ def train_stage1(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
     softmax_history = np.zeros((args.epochs, num_samples, num_classes), dtype=np.float32)
     margin_history = np.zeros((args.epochs, num_samples), dtype=np.float32)
 
-    logging.info("Stage 1 started: epochs=%d, samples=%d", args.epochs, num_samples)
+    logging.info(
+        "Stage 1 started: dataset=%s, epochs=%d, samples=%d, label_key=%s",
+        args.dataset,
+        args.epochs,
+        num_samples,
+        label_key,
+    )
     for epoch in range(args.epochs):
         model.train()
         sample_idx = 0
@@ -113,12 +159,12 @@ def train_stage1(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
 
         logging.info("Epoch %d/%d completed", epoch + 1, args.epochs)
 
-    output_dir = Path(args.output_dir)
+    output_dir = Path(args.output_dir or config["default_output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    softmax_path = output_dir / "softmax_history_cifar10n.npy"
-    margin_path = output_dir / "margin_history_cifar10n.npy"
-    backbone_path = output_dir / "resnet18_backbone.pth"
+    softmax_path = output_dir / str(config["softmax_file"])
+    margin_path = output_dir / str(config["margin_file"])
+    backbone_path = output_dir / str(config["backbone_file"])
 
     np.save(softmax_path, softmax_history)
     np.save(margin_path, margin_history)

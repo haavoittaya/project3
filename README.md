@@ -9,6 +9,9 @@ This repository implements a two-stage pipeline for distilling training dynamics
 - `train_stage1.py`: trajectory tracking and backbone training
 - `train_stage2.py`: descriptor target construction and MLP distillation
 - `evaluate_ood.py`: noisy-label, OOD, and robustness evaluation
+- `train_stage1_cifar100n.py`: CIFAR-100N trajectory tracking and backbone training
+- `train_stage2_cifar100n.py`: CIFAR-100N descriptor distillation
+- `evaluate_ood_cifar100n.py`: CIFAR-100N noisy-label, OOD, and robustness evaluation
 
 ## Requirements
 
@@ -22,6 +25,7 @@ pip install -r requirements.txt
 
 - CIFAR-10 is downloaded automatically via torchvision.
 - CIFAR-10N metadata is downloaded automatically as a single `CIFAR-10_human.pt` file from a fast mirror, instead of cloning the full repository.
+- CIFAR-100N metadata is downloaded automatically as a single `CIFAR-100_human.pt` file from a fast mirror.
 - Stage outputs are saved to `./artifacts` by default.
 
 Expected artifacts after full run:
@@ -32,6 +36,58 @@ Expected artifacts after full run:
 - `artifacts/mlp_4d_cifar10n.pth`
 - `artifacts/X_features.npy`
 - `artifacts/Y_targets_4d.npy`
+
+Expected artifacts for CIFAR-100N pipeline (default `./artifacts_cifar100n`):
+
+- `artifacts_cifar100n/softmax_history_cifar100n.npy`
+- `artifacts_cifar100n/margin_history_cifar100n.npy`
+- `artifacts_cifar100n/resnet18_backbone_cifar100n.pth`
+- `artifacts_cifar100n/mlp_4d_cifar100n.pth`
+- `artifacts_cifar100n/X_features_cifar100n.npy`
+- `artifacts_cifar100n/Y_targets_4d_cifar100n.npy`
+
+## Unified Pipeline (Single Scripts)
+
+All main scripts now support both datasets via `--dataset`:
+
+- `cifar10n`
+- `cifar100n`
+
+Stage 1 (CIFAR-10N):
+
+```powershell
+python train_stage1.py --dataset cifar10n --epochs 50 --batch-size 256 --lr 0.001 --seed 42
+```
+
+Stage 1 (CIFAR-100N):
+
+```powershell
+python train_stage1.py --dataset cifar100n --epochs 50 --batch-size 256 --lr 0.001 --seed 42
+```
+
+Stage 2 (CIFAR-10N):
+
+```powershell
+python train_stage2.py --dataset cifar10n --epochs 40 --batch-size 512 --lr 0.005 --seed 42
+```
+
+Stage 2 (CIFAR-100N):
+
+```powershell
+python train_stage2.py --dataset cifar100n --epochs 40 --batch-size 512 --lr 0.005 --seed 42
+```
+
+Evaluation (CIFAR-10N):
+
+```powershell
+python evaluate_ood.py --dataset cifar10n --batch-size 256
+```
+
+Evaluation (CIFAR-100N):
+
+```powershell
+python evaluate_ood.py --dataset cifar100n --batch-size 256
+```
 
 ## Stage 1: Trajectory Tracking
 
@@ -55,6 +111,26 @@ Run evaluation on noisy-label detection, OOD detection (CIFAR-10 vs SVHN), and s
 
 ```powershell
 python evaluate_ood.py --batch-size 256
+```
+
+## CIFAR-100N Pipeline
+
+Stage 1 (CIFAR-100N):
+
+```powershell
+python train_stage1_cifar100n.py --epochs 50 --batch-size 256 --lr 0.001 --seed 42
+```
+
+Stage 2 (CIFAR-100N):
+
+```powershell
+python train_stage2_cifar100n.py --epochs 40 --batch-size 512 --lr 0.005 --seed 42
+```
+
+Evaluation (CIFAR-100N):
+
+```powershell
+python evaluate_ood_cifar100n.py --batch-size 256
 ```
 
 Reported metrics include:

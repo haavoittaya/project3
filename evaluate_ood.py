@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import cv2
 import matplotlib.pyplot as plt
@@ -14,15 +14,57 @@ import torchvision.transforms as transforms
 from sklearn.metrics import average_precision_score, roc_auc_score
 from torch.utils.data import DataLoader
 
-from src.dataset import setup_cifar10n
+from src.dataset import setup_cifar100n, setup_cifar10n
 from src.models import AdvancedMLP, FeatureExtractor, get_resnet18_backbone
+
+DATASET_CONFIG: Dict[str, Dict[str, Any]] = {
+    "cifar10n": {
+        "num_classes": 10,
+        "default_artifacts_dir": "./artifacts",
+        "default_reports_dir": "./artifacts/reports",
+        "default_train_label_key": "aggre_label",
+        "default_eval_label_key": "worse_label",
+        "clean_label_key": "clean_label",
+        "backbone_file": "resnet18_backbone.pth",
+        "mlp_file": "mlp_4d_cifar10n.pth",
+        "features_file": "X_features.npy",
+        "noisy_report_prefix": "worse_split",
+        "ood_report_prefix": "ood_cifar10_vs_svhn",
+        "ood_title": "OOD detection (CIFAR-10 vs SVHN)",
+        "noisy_title": "Noisy label detection (Worse split)",
+        "setup_fn": setup_cifar10n,
+    },
+    "cifar100n": {
+        "num_classes": 100,
+        "default_artifacts_dir": "./artifacts_cifar100n",
+        "default_reports_dir": "./artifacts_cifar100n/reports",
+        "default_train_label_key": "noisy_label",
+        "default_eval_label_key": "noisy_label",
+        "clean_label_key": "clean_label",
+        "backbone_file": "resnet18_backbone_cifar100n.pth",
+        "mlp_file": "mlp_4d_cifar100n.pth",
+        "features_file": "X_features_cifar100n.npy",
+        "noisy_report_prefix": "cifar100n_noisy_labels",
+        "ood_report_prefix": "ood_cifar100_vs_svhn",
+        "ood_title": "OOD detection (CIFAR-100 vs SVHN)",
+        "noisy_title": "Noisy label detection (CIFAR-100N)",
+        "setup_fn": setup_cifar100n,
+    },
+}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate distilled descriptors on noisy labels, OOD data, and synthetic corruptions."
     )
-    parser.add_argument("--data-root", type=str, default="./data", help="CIFAR-10 data directory.")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=("cifar10n", "cifar100n"),
+        default="cifar10n",
+        help="Dataset/noise benchmark to evaluate.",
+    )
+    parser.add_argument("--data-root", type=str, default="./data", help="Dataset directory.")
     parser.add_argument(
         "--repo-root",
         type=str,
@@ -38,16 +80,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--artifacts-dir",
         type=str,
-        default="./artifacts",
-        help="Directory with stage-1 and stage-2 artifacts.",
+        default=None,
+        help="Directory with stage-1 and stage-2 artifacts (auto-selected if omitted).",
     )
     parser.add_argument(
         "--reports-dir",
         type=str,
-        default="./artifacts/reports",
-        help="Directory for evaluation reports (CSV/PNG).",
+        default=None,
+        help="Directory for evaluation reports (CSV/PNG) (auto-selected if omitted).",
     )
     parser.add_argument("--batch-size", type=int, default=256, help="Feature extraction batch size.")
+    parser.add_argument(
+        "--label-key",
+        type=str,
+        default=None,
+        help="Optional training-label key used for descriptor computation semantics.",
+    )
+    parser.add_argument(
+        "--eval-label-key",
+        type=str,
+        default=None,
+        help="Optional label key used for noisy-label evaluation target.",
+    )
     return parser.parse_args()
 
 
@@ -138,16 +192,22 @@ def apply_corruption(images_tensor: torch.Tensor, corruption_type: str, severity
     return torch.tensor(np.array(corrupted_list), dtype=torch.float32).permute(0, 3, 1, 2)
 
 
-def build_models(artifacts_dir: Path, device: torch.device) -> Tuple[FeatureExtractor, AdvancedMLP]:
-    backbone_path = artifacts_dir / "resnet18_backbone.pth"
-    mlp_path = artifacts_dir / "mlp_4d_cifar10n.pth"
+def build_models(
+    artifacts_dir: Path,
+    backbone_file: str,
+    mlp_file: str,
+    num_classes: int,
+    device: torch.device,
+) -> Tuple[FeatureExtractor, AdvancedMLP]:
+    backbone_path = artifacts_dir / backbone_file
+    mlp_path = artifacts_dir / mlp_file
 
     if not backbone_path.exists() or not mlp_path.exists():
         raise FileNotFoundError(
             f"Missing model artifacts in {artifacts_dir}. Expected {backbone_path} and {mlp_path}."
         )
 
-    backbone = get_resnet18_backbone()
+    backbone = get_resnet18_backbone(num_classes=num_classes)
     backbone.load_state_dict(torch.load(backbone_path, map_location=device, weights_only=True))
     backbone.to(device)
     backbone.eval()
@@ -176,39 +236,64 @@ def extract_features(dataset, extractor: FeatureExtractor, batch_size: int, devi
 
 def run_evaluation(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    artifacts_dir = Path(args.artifacts_dir)
-    reports_dir = Path(args.reports_dir)
+    config = DATASET_CONFIG[args.dataset]
+    artifacts_dir = Path(args.artifacts_dir or config["default_artifacts_dir"])
+    reports_dir = Path(args.reports_dir or config["default_reports_dir"])
+    train_label_key = args.label_key or config["default_train_label_key"]
+    eval_label_key = args.eval_label_key or config["default_eval_label_key"]
+    clean_label_key = str(config["clean_label_key"])
+    setup_fn = config["setup_fn"]
 
-    extractor, mlp = build_models(artifacts_dir, device)
+    extractor, mlp = build_models(
+        artifacts_dir,
+        str(config["backbone_file"]),
+        str(config["mlp_file"]),
+        int(config["num_classes"]),
+        device,
+    )
 
-    features_path = artifacts_dir / "X_features.npy"
+    features_path = artifacts_dir / str(config["features_file"])
     if features_path.exists():
         x_features = np.load(features_path)
         logging.info("Loaded cached ID feature matrix: %s", features_path)
     else:
-        trainset, _ = setup_cifar10n(data_root=args.data_root, repo_root=args.repo_root)
+        trainset, _ = setup_fn(data_root=args.data_root, repo_root=args.repo_root)
         x_features = extract_features(trainset, extractor, args.batch_size, device)
         logging.info("Cached feature matrix not found; extracted features on-the-fly.")
 
-    _, noise_data = setup_cifar10n(data_root=args.data_root, repo_root=args.repo_root)
+    _, noise_data = setup_fn(data_root=args.data_root, repo_root=args.repo_root)
+    if eval_label_key not in noise_data or clean_label_key not in noise_data:
+        raise KeyError(
+            "Missing required keys for noisy-label evaluation. "
+            f"Required: {eval_label_key}, {clean_label_key}; available: {list(noise_data.keys())}"
+        )
 
     with torch.no_grad():
         id_preds = mlp(torch.from_numpy(x_features).to(device)).cpu().numpy()
 
     pred_aum = id_preds[:, 0]
-    is_worse_error = (noise_data["worse_label"] != noise_data["clean_label"]).astype(np.int32)
+    eval_labels = np.array(noise_data[eval_label_key])
+    clean_labels = np.array(noise_data[clean_label_key])
+    is_noisy_error = (eval_labels != clean_labels).astype(np.int32)
 
-    noisy_auroc = roc_auc_score(is_worse_error, -pred_aum)
-    noisy_auprc = average_precision_score(is_worse_error, -pred_aum)
-    noisy_coverage, noisy_risk, noisy_aurc = compute_risk_coverage(is_worse_error, -pred_aum)
+    noisy_auroc = roc_auc_score(is_noisy_error, -pred_aum)
+    noisy_auprc = average_precision_score(is_noisy_error, -pred_aum)
+    noisy_coverage, noisy_risk, noisy_aurc = compute_risk_coverage(is_noisy_error, -pred_aum)
 
     logging.info(
-        "Noisy label detection (Worse split) | AUROC: %.4f | AUPRC: %.4f | AURC: %.4f",
+        "%s | AUROC: %.4f | AUPRC: %.4f | AURC: %.4f",
+        str(config["noisy_title"]),
         noisy_auroc,
         noisy_auprc,
         noisy_aurc,
     )
-    save_risk_coverage_report(noisy_coverage, noisy_risk, noisy_aurc, "worse_split", reports_dir)
+    save_risk_coverage_report(
+        noisy_coverage,
+        noisy_risk,
+        noisy_aurc,
+        str(config["noisy_report_prefix"]),
+        reports_dir,
+    )
 
     svhn = torchvision.datasets.SVHN(
         root=args.svhn_root,
@@ -232,15 +317,27 @@ def run_evaluation(args: argparse.Namespace) -> None:
     ood_coverage, ood_risk, ood_aurc = compute_risk_coverage(ood_labels, ood_confidence)
 
     logging.info(
-        "OOD detection (CIFAR-10 vs SVHN) | AUROC: %.4f | AUPRC: %.4f | AURC: %.4f",
+        "%s | AUROC: %.4f | AUPRC: %.4f | AURC: %.4f",
+        str(config["ood_title"]),
         ood_auroc,
         ood_auprc,
         ood_aurc,
     )
-    save_risk_coverage_report(ood_coverage, ood_risk, ood_aurc, "ood_cifar10_vs_svhn", reports_dir)
+    save_risk_coverage_report(
+        ood_coverage,
+        ood_risk,
+        ood_aurc,
+        str(config["ood_report_prefix"]),
+        reports_dir,
+    )
     logging.info("Mean predicted AUM | ID: %.4f | OOD: %.4f", np.mean(id_scores), np.mean(ood_scores))
 
-    trainset, _ = setup_cifar10n(data_root=args.data_root, repo_root=args.repo_root)
+    trainset, noise_data_for_train = setup_fn(data_root=args.data_root, repo_root=args.repo_root)
+    if train_label_key not in noise_data_for_train:
+        raise KeyError(
+            f"Training label key '{train_label_key}' not found. "
+            f"Available keys: {list(noise_data_for_train.keys())}"
+        )
     clean_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=False)
     clean_batch, _ = next(iter(clean_loader))
 
