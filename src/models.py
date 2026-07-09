@@ -156,4 +156,3 @@ class TrajectoryGenerator(nn.Module):
         x = self.temporal_head(x)
         x = x.squeeze(1) if self.output_channels == 1 else x.transpose(1, 2)
         return self.logit_norm(x)
-*** End Patch
