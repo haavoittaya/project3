@@ -230,6 +230,32 @@ def build_svhn_dataset(root: str) -> Dataset:
     return torchvision.datasets.SVHN(root=root, split="test", download=True, transform=transforms.ToTensor())
 
 
+def stratified_split_indices(
+    indices: np.ndarray,
+    labels: np.ndarray,
+    val_fraction: float,
+    seed: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if not 0.0 < val_fraction < 1.0:
+        raise ValueError("val_fraction must be between 0 and 1")
+
+    rng = np.random.default_rng(seed)
+    train_indices: List[int] = []
+    val_indices: List[int] = []
+
+    for class_value in np.unique(labels[indices]):
+        class_indices = indices[labels[indices] == class_value]
+        if class_indices.size == 0:
+            continue
+        shuffled = class_indices.copy()
+        rng.shuffle(shuffled)
+        val_count = max(1, int(round(shuffled.size * val_fraction)))
+        val_indices.extend(shuffled[:val_count].tolist())
+        train_indices.extend(shuffled[val_count:].tolist())
+
+    return np.asarray(train_indices, dtype=np.int64), np.asarray(val_indices, dtype=np.int64)
+
+
 def forward_with_features(backbone: torch.nn.Module, images: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     x = backbone.conv1(images)
     x = backbone.bn1(x)
@@ -354,7 +380,7 @@ def score_logitnorm(logits: np.ndarray, tau: float, mode: str) -> np.ndarray:
     if mode == "msp":
         certainty = torch.softmax(normalized, dim=-1).max(dim=-1).values
     else:
-        certainty = torch.logsumexp(normalized, dim=-1)
+        certainty = -torch.logsumexp(normalized, dim=-1)
 
     return certainty.cpu().numpy().astype(np.float32)
 
@@ -407,18 +433,27 @@ def build_groups(
     clean_labels = np.asarray(trainset_clean.targets, dtype=np.int64)
     noisy_labels = np.asarray(noise_data[spec.train_noise_key], dtype=np.int64)
     noise_mask = noisy_labels != np.asarray(noise_data[spec.clean_label_key], dtype=np.int64)
-    noisy_indices = np.flatnonzero(noise_mask).tolist()
+    noisy_indices = np.flatnonzero(noise_mask)
+    clean_indices = np.flatnonzero(~noise_mask)
+    clean_fit_indices, clean_val_indices = stratified_split_indices(
+        clean_indices,
+        clean_labels,
+        val_fraction=0.2,
+        seed=42,
+    )
 
     base_name = "cifar10" if spec.name == "cifar10n" else "cifar100"
-    clean_id = build_standard_dataset(base_name, root=data_root, train=False)
+    clean_id = Subset(trainset_clean, clean_val_indices.tolist())
     near_ood_name = "cifar100" if base_name == "cifar10" else "cifar10"
     near_ood = build_standard_dataset(near_ood_name, root=data_root, train=False)
     far_ood = build_svhn_dataset(svhn_root)
-    noisy_id = Subset(trainset_clean, noisy_indices)
+    noisy_id = Subset(trainset_clean, noisy_indices.tolist())
+    clean_fit = Subset(trainset_clean, clean_fit_indices.tolist())
 
     logging.info(
-        "Group sizes | Clean ID(test): %d | Noisy ID(train subset): %d | Near-OOD(%s): %d | Far-OOD(SVHN): %d",
+        "Group sizes | Clean ID(val): %d | Clean-fit subset: %d | Noisy ID(train subset): %d | Near-OOD(%s): %d | Far-OOD(SVHN): %d",
         len(clean_id),
+        len(clean_fit),
         len(noisy_id),
         spec.opposite_name,
         len(near_ood),
@@ -431,7 +466,7 @@ def build_groups(
         noise_mask.shape[0],
     )
 
-    return trainset_clean, noisy_id, clean_id, near_ood, far_ood, clean_labels
+    return clean_fit, noisy_id, clean_id, near_ood, far_ood, clean_labels[clean_fit_indices]
 
 
 def run_evaluation(args: argparse.Namespace) -> None:
@@ -452,7 +487,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
         dropout=args.trajectory_dropout,
     )
 
-    trainset_clean, noisy_id, clean_id, near_ood, far_ood, train_labels = build_groups(
+    clean_fit, noisy_id, clean_id, near_ood, far_ood, train_labels = build_groups(
         spec=spec,
         data_root=args.data_root,
         repo_root=args.repo_root,
@@ -466,7 +501,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
     far_outputs = collect_outputs(far_ood, backbone, args.batch_size, device)
 
     logging.info("Fitting Mahalanobis baseline on clean ID training features...")
-    train_outputs = collect_outputs(trainset_clean, backbone, args.score_batch_size, device)
+    train_outputs = collect_outputs(clean_fit, backbone, args.score_batch_size, device)
     class_means, precision = fit_mahalanobis(train_outputs.features, train_labels, spec.num_classes, args.mahalanobis_reg)
 
     logging.info("Computing certainty scores for baseline methods...")

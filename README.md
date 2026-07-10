@@ -136,7 +136,7 @@ python evaluate_ood.py --dataset cifar100n --batch-size 256
 
 The main evaluation script now uses four groups for the selected ID dataset:
 
-- Clean ID: test split with correct labels
+- Clean ID: stratified validation split sampled from correctly labeled training samples
 - Noisy ID: noisy training subset with human-flipped labels
 - Near-OOD: CIFAR-100 when ID is CIFAR-10, and CIFAR-10 when ID is CIFAR-100
 - Far-OOD: SVHN test split
