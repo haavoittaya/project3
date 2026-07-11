@@ -32,7 +32,7 @@ def main():
         help="Корневая папка для сохранения всех результатов",
     )
 
-    # Параметры для Stage 2 (из нашего прошлого обсуждения стабильности)
+    # Параметры для Stage 2
     parser.add_argument(
         "--lr2",
         type=float,
@@ -42,23 +42,20 @@ def main():
     parser.add_argument(
         "--epochs2",
         type=int,
-        default=50,
+        default=80,
         help="Количество эпох для генератора траекторий (Stage 2)",
     )
 
     args = parser.parse_args()
 
-    # Определяем имена скриптов в зависимости от выбранного датасета
-    if args.dataset == "cifar10n":
-        stage1_script = "train_stage1.py"
-        stage2_script = "train_stage2.py"
-        eval_script = "evaluate_ood.py"
-    else:
-        stage1_script = "train_stage1_cifar100n.py"
-        stage2_script = "train_stage2_cifar100n.py"
-        eval_script = "evaluate_ood_cifar100n.py"
+    # В новой версии проекта скрипты одни и те же для всех датасетов
+    stage1_script = "train_stage1.py"
+    stage2_script = "train_stage2.py"
+    eval_script = "evaluate_ood.py"
 
     output_root = Path(args.output_root)
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"  # Чтобы логи выводились сразу, без задержек
 
     print(f"=== Запуск серии экспериментов для {args.dataset} ===")
     print(
@@ -80,32 +77,34 @@ def main():
         reports_dir.mkdir(parents=True, exist_ok=True)
 
         # ==========================================
-        # СТЕЙДЖ 1: Обучение бэкбоуна и сбор траекторий
+        # СТЕЙДЖ 1
         # ==========================================
         print(f"     Запуск Stage 1 ({stage1_script})...")
         cmd_stage1 = [
             sys.executable,
             stage1_script,
+            "--dataset",
+            args.dataset,
             "--seed",
             str(current_seed),
             "--output-dir",
             str(artifacts_dir),
         ]
 
-        res1 = subprocess.run(cmd_stage1)
+        res1 = subprocess.run(cmd_stage1, env=env)
         if res1.returncode != 0:
-            print(
-                f"❌ Ошибка на Stage 1 с сидом {current_seed}. Прерываем серию."
-            )
+            print(f"❌ Ошибка на Stage 1 с сидом {current_seed}. Прерываем серию.")
             sys.exit(res1.returncode)
 
         # ==========================================
-        # СТЕЙДЖ 2: Дистилляция траекторий в генератор
+        # СТЕЙДЖ 2
         # ==========================================
         print(f"     Запуск Stage 2 ({stage2_script})...")
         cmd_stage2 = [
             sys.executable,
             stage2_script,
+            "--dataset",
+            args.dataset,
             "--seed",
             str(current_seed),
             "--artifacts-dir",
@@ -116,31 +115,29 @@ def main():
             str(args.epochs2),
         ]
 
-        res2 = subprocess.run(cmd_stage2)
+        res2 = subprocess.run(cmd_stage2, env=env)
         if res2.returncode != 0:
-            print(
-                f"❌ Ошибка на Stage 2 с сидом {current_seed}. Прерываем серию."
-            )
+            print(f"❌ Ошибка на Stage 2 с сидом {current_seed}. Прерываем серию.")
             sys.exit(res2.returncode)
 
         # ==========================================
-        # ОЦЕНКА (EVALUATE OOD)
+        # ОЦЕНКА
         # ==========================================
         print(f"     Запуск Evaluation ({eval_script})...")
         cmd_eval = [
             sys.executable,
             eval_script,
+            "--dataset",
+            args.dataset,
             "--artifacts-dir",
             str(artifacts_dir),
             "--reports-dir",
             str(reports_dir),
         ]
 
-        res3 = subprocess.run(cmd_eval)
+        res3 = subprocess.run(cmd_eval, env=env)
         if res3.returncode != 0:
-            print(
-                f"❌ Ошибка при оценке с сидом {current_seed}. Прерываем серию."
-            )
+            print(f"❌ Ошибка при оценке с сидом {current_seed}. Прерываем серию.")
             sys.exit(res3.returncode)
 
         print(
