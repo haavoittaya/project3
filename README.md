@@ -8,6 +8,7 @@ This repository implements a two-stage pipeline for distilling training dynamics
 - `src/dataset.py`: CIFAR-10/CIFAR-10N data setup and repository bootstrap
 - `train_stage1.py`: trajectory tracking and backbone training
 - `train_stage2.py`: full trajectory distillation with TrajectoryGenerator
+- `train_trajectory_cvae.py`: conditional trajectory generation with a CVAE and logging
 - `evaluate_ood.py`: OOD-centric evaluation across clean ID, noisy ID, near-OOD, and far-OOD groups
 - `train_stage1_cifar100n.py`: CIFAR-100N trajectory tracking and backbone training
 - `train_stage2_cifar100n.py`: CIFAR-100N descriptor distillation
@@ -104,6 +105,21 @@ Train a trajectory generator to regress the full epoch-wise margin sequence:
 ```powershell
 python train_stage2.py --epochs 40 --batch-size 512 --lr 0.005 --seed 42
 ```
+
+## Trajectory CVAE Generation
+
+Generate full softmax trajectories from frozen embeddings and log reconstruction/KL statistics:
+
+```powershell
+python train_trajectory_cvae.py --dataset cifar100n --epochs 50 --batch-size 256 --lr 0.001 --seed 42
+```
+
+Logged outputs include:
+
+- `trajectory_cvae.pth`
+- `generated_trajectory_preview_<dataset>.npy`
+- `X_features_<dataset>.npy`
+- `trajectory_targets_<dataset>_softmax.npy`
 
 ## CIFAR-100N Pipeline
 

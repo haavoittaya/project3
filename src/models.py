@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision
 
 
@@ -156,3 +158,189 @@ class TrajectoryGenerator(nn.Module):
         x = self.temporal_head(x)
         x = x.squeeze(1) if self.output_channels == 1 else x.transpose(1, 2)
         return self.logit_norm(x)
+
+
+@dataclass
+class TrajectoryCVAEResult:
+    """Container returned by the trajectory CVAE forward pass."""
+
+    generated_trajectory: torch.Tensor
+    mu: torch.Tensor
+    logvar: torch.Tensor
+    latent: torch.Tensor
+
+
+class TrajectoryCVAE(nn.Module):
+    """Conditional VAE that generates the full prediction trajectory from static features.
+
+    The model conditions on frozen backbone embeddings of shape ``[batch, input_dim]``
+    and reconstructs a sequence of prediction vectors with shape
+    ``[batch, sequence_length, num_classes]``.
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 512,
+        sequence_length: int = 50,
+        num_classes: int = 100,
+        latent_dim: int = 128,
+        hidden_dim: int = 512,
+        dropout: float = 0.1,
+        output_activation: str = "softmax",
+    ) -> None:
+        super().__init__()
+        if input_dim <= 0:
+            raise ValueError("input_dim must be positive")
+        if sequence_length <= 0:
+            raise ValueError("sequence_length must be positive")
+        if num_classes <= 0:
+            raise ValueError("num_classes must be positive")
+        if latent_dim <= 0 or hidden_dim <= 0:
+            raise ValueError("latent_dim and hidden_dim must be positive")
+
+        self.input_dim = int(input_dim)
+        self.sequence_length = int(sequence_length)
+        self.num_classes = int(num_classes)
+        self.latent_dim = int(latent_dim)
+        self.output_activation = output_activation
+
+        if self.output_activation not in {"none", "softmax"}:
+            raise ValueError("output_activation must be either 'none' or 'softmax'")
+
+        trajectory_dim = self.sequence_length * self.num_classes
+
+        self.encoder = nn.Sequential(
+            nn.Linear(self.input_dim + trajectory_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.mu_head = nn.Linear(hidden_dim, self.latent_dim)
+        self.logvar_head = nn.Linear(hidden_dim, self.latent_dim)
+
+        self.decoder = nn.Sequential(
+            nn.Linear(self.input_dim + self.latent_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, trajectory_dim),
+        )
+
+    def encode(self, features: torch.Tensor, trajectory: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode the conditional input and trajectory into the latent posterior."""
+        if features.ndim != 2:
+            raise ValueError("features must have shape [batch, input_dim]")
+        if trajectory.ndim != 3:
+            raise ValueError("trajectory must have shape [batch, sequence_length, num_classes]")
+
+        batch_size = features.shape[0]
+        flattened_trajectory = trajectory.reshape(batch_size, -1)
+        encoded = self.encoder(torch.cat([features, flattened_trajectory], dim=-1))
+        mu = self.mu_head(encoded)
+        logvar = self.logvar_head(encoded)
+        return mu, logvar
+
+    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        """Sample from the latent posterior using the reparameterization trick."""
+        std = torch.exp(0.5 * logvar)
+        epsilon = torch.randn_like(std)
+        return mu + epsilon * std
+
+    def decode(self, features: torch.Tensor, latent: torch.Tensor) -> torch.Tensor:
+        """Decode a latent sample into a full trajectory."""
+        if features.ndim != 2:
+            raise ValueError("features must have shape [batch, input_dim]")
+        if latent.ndim != 2:
+            raise ValueError("latent must have shape [batch, latent_dim]")
+
+        batch_size = features.shape[0]
+        decoded = self.decoder(torch.cat([features, latent], dim=-1))
+        decoded = decoded.view(batch_size, self.sequence_length, self.num_classes)
+        if self.output_activation == "softmax":
+            decoded = torch.softmax(decoded, dim=-1)
+        return decoded
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        trajectory: Optional[torch.Tensor] = None,
+    ) -> TrajectoryCVAEResult:
+        """Run the conditional VAE.
+
+        Args:
+            features: Frozen embeddings with shape ``[batch, input_dim]``.
+            trajectory: Optional ground-truth trajectory used during training.
+
+        Returns:
+            A :class:`TrajectoryCVAEResult` with generated trajectory and latent stats.
+        """
+        if trajectory is not None:
+            mu, logvar = self.encode(features, trajectory)
+            latent = self.reparameterize(mu, logvar)
+        else:
+            batch_size = features.shape[0]
+            mu = torch.zeros(batch_size, self.latent_dim, device=features.device, dtype=features.dtype)
+            logvar = torch.zeros_like(mu)
+            latent = torch.randn_like(mu)
+
+        generated_trajectory = self.decode(features, latent)
+        return TrajectoryCVAEResult(
+            generated_trajectory=generated_trajectory,
+            mu=mu,
+            logvar=logvar,
+            latent=latent,
+        )
+
+    def generate(self, features: torch.Tensor) -> torch.Tensor:
+        """Generate a trajectory from features only."""
+        return self.forward(features, trajectory=None).generated_trajectory
+
+
+@dataclass
+class TrajectoryCVAELossOutput:
+    """Loss components for trajectory CVAE training."""
+
+    total_loss: torch.Tensor
+    reconstruction_loss: torch.Tensor
+    kl_divergence: torch.Tensor
+
+
+def trajectory_cvae_loss(
+    predicted_trajectory: torch.Tensor,
+    target_trajectory: torch.Tensor,
+    mu: torch.Tensor,
+    logvar: torch.Tensor,
+    *,
+    reconstruction_loss: str = "smooth_l1",
+    kl_weight: float = 1.0,
+) -> TrajectoryCVAELossOutput:
+    """Compute a CVAE loss for trajectory generation.
+
+    Args:
+        predicted_trajectory: Model output with shape ``[batch, T, C]``.
+        target_trajectory: Ground-truth trajectory with the same shape.
+        mu: Latent mean from the encoder.
+        logvar: Latent log-variance from the encoder.
+        reconstruction_loss: Either ``"smooth_l1"`` or ``"mse"``.
+        kl_weight: Multiplier for the KL term.
+    """
+    if reconstruction_loss == "smooth_l1":
+        recon_loss = F.smooth_l1_loss(predicted_trajectory, target_trajectory)
+    elif reconstruction_loss == "mse":
+        recon_loss = F.mse_loss(predicted_trajectory, target_trajectory)
+    else:
+        raise ValueError("reconstruction_loss must be 'smooth_l1' or 'mse'")
+
+    kl_divergence = -0.5 * torch.mean(1.0 + logvar - mu.pow(2) - logvar.exp())
+    total_loss = recon_loss + kl_weight * kl_divergence
+    return TrajectoryCVAELossOutput(
+        total_loss=total_loss,
+        reconstruction_loss=recon_loss,
+        kl_divergence=kl_divergence,
+    )
