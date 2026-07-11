@@ -1,0 +1,13 @@
+method,task,auroc,auprc,aurc
+MSP,Clean ID vs Noisy ID,0.614048,0.826431,0.691640
+MSP,Clean ID vs Near-OOD (CIFAR-10),0.807987,0.849430,0.377424
+MSP,Clean ID vs Far-OOD (SVHN),0.856413,0.952766,0.581172
+LogitNorm-MSP,Clean ID vs Noisy ID,0.623988,0.830465,0.687367
+LogitNorm-MSP,Clean ID vs Near-OOD (CIFAR-10),0.837462,0.875535,0.363094
+LogitNorm-MSP,Clean ID vs Far-OOD (SVHN),0.895728,0.967531,0.563729
+Mahalanobis,Clean ID vs Noisy ID,0.505266,0.770578,0.765794
+Mahalanobis,Clean ID vs Near-OOD (CIFAR-10),0.426722,0.565610,0.666516
+Mahalanobis,Clean ID vs Far-OOD (SVHN),0.241792,0.687763,0.915653
+Trajectory,Clean ID vs Noisy ID,0.768932,0.907579,0.587579
+Trajectory,Clean ID vs Near-OOD (CIFAR-10),0.676227,0.736042,0.467063
+Trajectory,Clean ID vs Far-OOD (SVHN),0.846013,0.952323,0.600173
