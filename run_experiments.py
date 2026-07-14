@@ -41,6 +41,12 @@ def parse_args() -> argparse.Namespace:
         "--output-root", type=str, default="./experiments",
         help="Root directory where all seed-isolated subfolders will be generated."
     )
+    parser.add_argument(
+        "--sequence-length",
+        type=int,
+        default=50,
+        help="Trajectory sequence length (accepted for orchestrator alignment)."
+    )
 
     # ==========================================
     # STAGE 1: BACKBONE TRAINING SETTINGS
@@ -137,7 +143,6 @@ def execute_subprocess(cmd: List[str], env: dict[str, str], stage_name: str) -> 
     logging.info("Command: %s", " ".join(cmd))
     
     start_time = time.time()
-    # Run subprocess and stream logs directly to console
     result = subprocess.run(cmd, env=env)
     elapsed_time = time.time() - start_time
     
@@ -154,9 +159,15 @@ def main() -> None:
 
     output_root = Path(args.output_root)
     
-    # Configure environment to prevent buffered outputs
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+
+    # Синхронизация параметров длины последовательности
+    final_seq_len = args.seq_len
+    if args.sequence_length != 50 and args.seq_len == 50:
+        final_seq_len = args.sequence_length
+    elif args.seq_len != 50:
+        final_seq_len = args.seq_len
 
     logging.info("=========================================================================")
     logging.info("       EXPERIMENTAL PIPELINE ORCHESTRATOR FOR BENCHMARK REPLICABILITY     ")
@@ -164,6 +175,7 @@ def main() -> None:
     logging.info("Target Dataset:  %s", args.dataset)
     logging.info("Initial Seed:    %d", args.start_seed)
     logging.info("Number of Runs:  %d", args.num_runs)
+    logging.info("Seq Length:      %d", final_seq_len)
     logging.info("Output Directory: %s", output_root.resolve())
     logging.info("=========================================================================\n")
 
@@ -171,7 +183,6 @@ def main() -> None:
         current_seed = args.start_seed + run_idx
         logging.info(">>> RUN [%d/%d] | INITIALIZING EXPERIMENT WITH SEED = %d <<<", run_idx + 1, args.num_runs, current_seed)
 
-        # Build seed-isolated directory structure
         run_dir = output_root / f"seed_{current_seed}"
         artifacts_dir = run_dir / "artifacts"
         reports_dir = run_dir / "reports"
@@ -202,7 +213,7 @@ def main() -> None:
             "--artifacts-dir", str(artifacts_dir),
             "--lr", str(args.lr_traj),
             "--epochs", str(args.epochs_traj),
-            "--sequence-length", str(args.seq_len)
+            "--sequence-length", str(final_seq_len)
         ]
         execute_subprocess(cmd_traj, env, f"Stage 2-A [Deterministic Trajectory - Seed {current_seed}]")
 
@@ -230,7 +241,7 @@ def main() -> None:
             "--lr", str(args.lr_cvae),
             "--epochs", str(args.epochs_cvae),
             "--latent-dim", str(args.latent_dim),
-            "--sequence-length", str(args.seq_len)
+            "--sequence-length", str(final_seq_len)
         ]
         execute_subprocess(cmd_cvae, env, f"Stage 2-C [Stochastic Trajectory CVAE - Seed {current_seed}]")
 
@@ -243,8 +254,16 @@ def main() -> None:
             "--artifacts-dir", str(artifacts_dir),
             "--reports-dir", str(reports_dir),
             "--batch-size", str(args.eval_batch_size),
-            "--trajectory-sequence-length", str(args.seq_len)
+            "--trajectory-sequence-length", str(final_seq_len)
         ]
         execute_subprocess(cmd_eval, env, f"Evaluation Protocol [Seed {current_seed}]")
 
         logging.info("Run %d completed. Outputs exported to: %s\n", run_idx + 1, run_dir.resolve())
+
+    logging.info("=========================================================================")
+    logging.info("🎉 SUCCESS: All planned benchmark runs completed successfully!")
+    logging.info("=========================================================================")
+
+
+if __name__ == "__main__":
+    main()

@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from src.dataset import setup_cifar100n, setup_cifar10n
 from src.models import FeatureExtractor, TrajectoryCVAE, get_resnet18_backbone, trajectory_cvae_loss
 
-# Configuration metadata dictionary matching Stage 1 tracking artifacts[cite: 10]
+# Configuration metadata dictionary matching Stage 1 tracking artifacts
 DATASET_CONFIG: Dict[str, Dict[str, Any]] = {
     "cifar10n": {
         "num_classes": 10,  
@@ -100,6 +100,13 @@ def parse_args() -> argparse.Namespace:
         default=0.1,
         help="Dropout rate inside the CVAE.",
     )
+    # ИСПРАВЛЕНО: Добавлен аргумент для согласования с оркестратором run_experiments.py
+    parser.add_argument(
+        "--sequence-length",
+        type=int,
+        default=50,
+        help="Trajectory sequence length (required for orchestrator alignment).",
+    )
     parser.add_argument(
         "--kl-weight",
         type=float,
@@ -138,7 +145,7 @@ def set_seed(seed: int) -> None:
 
 
 def load_trajectory_targets(history: np.ndarray) -> np.ndarray:
-    """Reformats trajectory data to ensure strict support for [T, N] and [T, N, C] history outputs[cite: 10]."""
+    """Reformats trajectory data to ensure strict support for [T, N] and [T, N, C] history outputs."""
     if history.ndim == 2:
         history = np.expand_dims(history, axis=-1)
     elif history.ndim != 3:
@@ -148,7 +155,7 @@ def load_trajectory_targets(history: np.ndarray) -> np.ndarray:
 
 def extract_features(trainset: Any, backbone_path: Path, num_classes: int, device: torch.device) -> np.ndarray:
     """
-    Extracts high-dimensional latent embeddings from the frozen backbone[cite: 10].
+    Extracts high-dimensional latent embeddings from the frozen backbone.
     METHODOLOGICAL FIX: Disables stochastic transformations temporarily to enforce 
     deterministic feature representation.
     """
@@ -194,7 +201,7 @@ def log_generation_snapshot(
     epoch: int,
     device: torch.device,
 ) -> None:
-    """Extracts a snapshot evaluation step to monitor generative progress[cite: 10]."""
+    """Extracts a snapshot evaluation step to monitor generative progress."""
     generator.eval()
     with torch.no_grad():
         generated = generator.generate(features.to(device)).cpu().numpy()
@@ -241,6 +248,14 @@ def train_trajectory_cvae(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
             f"Target count {trajectory_targets.shape[0]} does not match label count {noisy_labels.shape[0]}."
         )
 
+    actual_seq_len = trajectory_targets.shape[1]
+    if actual_seq_len != args.sequence_length:
+        logging.warning(
+            "Loaded trajectory sequence length (%d) does not match requested --sequence-length (%d). Using loaded length.",
+            actual_seq_len,
+            args.sequence_length,
+        )
+
     feature_matrix = extract_features(trainset, backbone_path, config["num_classes"], device)
     if feature_matrix.shape[0] != trajectory_targets.shape[0]:
         raise ValueError(
@@ -252,7 +267,7 @@ def train_trajectory_cvae(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
 
     generator = TrajectoryCVAE(
         input_dim=feature_matrix.shape[1],
-        sequence_length=trajectory_targets.shape[1],
+        sequence_length=actual_seq_len,  
         num_classes=trajectory_targets.shape[2],
         latent_dim=args.latent_dim,
         hidden_dim=args.hidden_dim,
@@ -266,7 +281,7 @@ def train_trajectory_cvae(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
         args.dataset,
         args.epochs,
         trajectory_targets.shape[0],
-        trajectory_targets.shape[1],
+        actual_seq_len,
         trajectory_targets.shape[2],
         label_key,
     )
