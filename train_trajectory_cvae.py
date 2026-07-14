@@ -1,3 +1,9 @@
+"""
+Stage 2: Train a Conditional Variational Autoencoder (CVAE) to generate 
+full prediction trajectories from frozen deterministic embeddings.
+This script ensures zero-leakage deterministic conditioning for CVAE training.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -9,32 +15,34 @@ from typing import Any, Dict, Tuple
 import numpy as np
 import torch
 import torch.optim as optim
+import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.dataset import setup_cifar100n, setup_cifar10n
 from src.models import FeatureExtractor, TrajectoryCVAE, get_resnet18_backbone, trajectory_cvae_loss
 
+# Configuration metadata dictionary matching Stage 1 tracking artifacts[cite: 10]
 DATASET_CONFIG: Dict[str, Dict[str, Any]] = {
     "cifar10n": {
-        "num_classes": 10,
+        "num_classes": 10,  
         "default_label_key": "aggre_label",
         "default_artifacts_dir": "./artifacts",
-        "softmax_file": "softmax_history_cifar10n.npy",
+        "history_file": "margin_history_cifar10n.npy",  
         "backbone_file": "resnet18_backbone.pth",
         "trajectory_cvae_file": "trajectory_cvae.pth",
         "features_file": "X_features_cifar10n.npy",
-        "targets_file": "trajectory_targets_cifar10n_softmax.npy",
+        "targets_file": "trajectory_targets_cifar10n_margin.npy",
         "setup_fn": setup_cifar10n,
     },
     "cifar100n": {
-        "num_classes": 100,
+        "num_classes": 100,  
         "default_label_key": "noisy_label",
         "default_artifacts_dir": "./artifacts_cifar100n",
-        "softmax_file": "softmax_history_cifar100n.npy",
+        "history_file": "margin_history_cifar100n.npy",  
         "backbone_file": "resnet18_backbone_cifar100n.pth",
         "trajectory_cvae_file": "trajectory_cvae.pth",
         "features_file": "X_features_cifar100n.npy",
-        "targets_file": "trajectory_targets_cifar100n_softmax.npy",
+        "targets_file": "trajectory_targets_cifar100n_margin.npy",
         "setup_fn": setup_cifar100n,
     },
 }
@@ -72,7 +80,7 @@ def parse_args() -> argparse.Namespace:
         "--label-key",
         type=str,
         default=None,
-        help="Optional label key from noise metadata (auto-selected by dataset if omitted).",
+        help="Optional label key from noise metadata.",
     )
     parser.add_argument(
         "--latent-dim",
@@ -95,8 +103,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--kl-weight",
         type=float,
-        default=1.0,
-        help="KL regularization weight.",
+        default=0.01,  
+        help="KL regularization weight to prevent posterior collapse.",
     )
     parser.add_argument(
         "--reconstruction-loss",
@@ -129,13 +137,21 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def load_trajectory_targets(softmax_history: np.ndarray) -> np.ndarray:
-    if softmax_history.ndim != 3:
-        raise ValueError("softmax_history must have shape [T, N, C]")
-    return np.transpose(softmax_history, (1, 0, 2)).astype(np.float32)
+def load_trajectory_targets(history: np.ndarray) -> np.ndarray:
+    """Reformats trajectory data to ensure strict support for [T, N] and [T, N, C] history outputs[cite: 10]."""
+    if history.ndim == 2:
+        history = np.expand_dims(history, axis=-1)
+    elif history.ndim != 3:
+        raise ValueError("History must have shape [T, N] or [T, N, C]")
+    return np.transpose(history, (1, 0, 2)).astype(np.float32)
 
 
-def extract_features(trainset, backbone_path: Path, num_classes: int, device: torch.device) -> np.ndarray:
+def extract_features(trainset: Any, backbone_path: Path, num_classes: int, device: torch.device) -> np.ndarray:
+    """
+    Extracts high-dimensional latent embeddings from the frozen backbone[cite: 10].
+    METHODOLOGICAL FIX: Disables stochastic transformations temporarily to enforce 
+    deterministic feature representation.
+    """
     backbone = get_resnet18_backbone(num_classes=num_classes)
     backbone.load_state_dict(torch.load(backbone_path, map_location=device, weights_only=True))
     backbone.to(device)
@@ -144,13 +160,30 @@ def extract_features(trainset, backbone_path: Path, num_classes: int, device: to
     extractor = FeatureExtractor(backbone).to(device)
     extractor.eval()
 
-    loader = DataLoader(trainset, batch_size=256, shuffle=False)
+    # Overwrite dynamic transform to secure strict, deterministic feature representation
+    original_transform = getattr(trainset, "transform", None)
+    trainset.transform = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+
+    loader = DataLoader(
+        trainset, 
+        batch_size=256, 
+        shuffle=False, 
+        num_workers=4, 
+        pin_memory=(device.type == "cuda")
+    )
     features_list = []
 
+    logging.info("Extracting deterministic features for CVAE conditioning...")
     with torch.no_grad():
         for images, _ in loader:
             embeddings = extractor(images.to(device))
             features_list.append(embeddings.cpu().numpy())
+
+    # Safely restore original training transform augmentations
+    if original_transform is not None:
+        trainset.transform = original_transform
 
     return np.concatenate(features_list, axis=0).astype(np.float32)
 
@@ -161,6 +194,7 @@ def log_generation_snapshot(
     epoch: int,
     device: torch.device,
 ) -> None:
+    """Extracts a snapshot evaluation step to monitor generative progress[cite: 10]."""
     generator.eval()
     with torch.no_grad():
         generated = generator.generate(features.to(device)).cpu().numpy()
@@ -184,14 +218,14 @@ def train_trajectory_cvae(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
     artifacts_dir = Path(args.artifacts_dir or config["default_artifacts_dir"])
     label_key = args.label_key or config["default_label_key"]
 
-    softmax_path = artifacts_dir / str(config["softmax_file"])
+    history_path = artifacts_dir / str(config["history_file"])
     backbone_path = artifacts_dir / str(config["backbone_file"])
     features_path = artifacts_dir / str(config["features_file"])
 
-    if not softmax_path.exists() or not backbone_path.exists():
+    if not history_path.exists() or not backbone_path.exists():
         raise FileNotFoundError(
-            "Required artifacts are missing. Expected files: "
-            f"{softmax_path}, {backbone_path}"
+            "Required Stage-1 artifacts are missing. Expected files: "
+            f"{history_path}, {backbone_path}"
         )
 
     trainset, noise_data = setup_fn(data_root=args.data_root, repo_root=args.repo_root)
@@ -199,8 +233,8 @@ def train_trajectory_cvae(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
         raise KeyError(f"Label key '{label_key}' not found. Available keys: {list(noise_data.keys())}")
 
     noisy_labels = np.asarray(noise_data[label_key], dtype=np.int64)
-    softmax_history = np.load(softmax_path)
-    trajectory_targets = load_trajectory_targets(softmax_history)
+    history_data = np.load(history_path)
+    trajectory_targets = load_trajectory_targets(history_data)
 
     if trajectory_targets.shape[0] != noisy_labels.shape[0]:
         raise ValueError(
@@ -214,7 +248,7 @@ def train_trajectory_cvae(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
         )
 
     dataset = TensorDataset(torch.from_numpy(feature_matrix), torch.from_numpy(trajectory_targets))
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=False)
 
     generator = TrajectoryCVAE(
         input_dim=feature_matrix.shape[1],
@@ -228,7 +262,7 @@ def train_trajectory_cvae(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
     optimizer = optim.Adam(generator.parameters(), lr=args.lr)
 
     logging.info(
-        "Trajectory CVAE started: dataset=%s, epochs=%d, samples=%d, sequence_length=%d, num_classes=%d, label_key=%s",
+        "Trajectory CVAE started on MARGINS: dataset=%s, epochs=%d, samples=%d, sequence_length=%d, target_dim=%d, label_key=%s",
         args.dataset,
         args.epochs,
         trajectory_targets.shape[0],
@@ -250,6 +284,7 @@ def train_trajectory_cvae(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
 
             optimizer.zero_grad(set_to_none=True)
             output = generator(batch_features, batch_targets)
+            
             loss_output = trajectory_cvae_loss(
                 output.generated_trajectory,
                 batch_targets,

@@ -1,74 +1,177 @@
+"""
+Reproducible Experiment Pipeline Orchestrator for Robust OOD and Label Noise Evaluation.
+Supports sequential pipeline runs (Stage 1 -> Stage 2 [MLP, Trajectory, CVAE] -> Evaluation) 
+with strict directory isolation, parameter customization, and seed incrementing.
+"""
+
+from __future__ import annotations
+
 import argparse
+import logging
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
+from typing import List
 
 
-def main():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Автоматический запуск пайплайна (Stage 1 -> Stage 2 -> Eval) с инкрементом сида."
-    )
-    parser.add_argument(
-        "--start-seed", type=int, default=42, help="Начальный random seed"
-    )
-    parser.add_argument(
-        "--num-runs",
-        type=int,
-        default=3,
-        help="Количество последовательных запусков",
-    )
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        choices=["cifar10n", "cifar100n"],
-        default="cifar100n",
-        help="На каком датасете запускать",
-    )
-    parser.add_argument(
-        "--output-root",
-        type=str,
-        default="./experiments",
-        help="Корневая папка для сохранения всех результатов",
+        description="Academic-grade pipeline runner for deterministic and stochastic OOD benchmarking."
     )
 
-    # Параметры для Stage 2
-    parser.add_argument(
-        "--lr2",
-        type=float,
-        default=0.001,
-        help="Learning rate для генератора траекторий (Stage 2)",
+    # ==========================================
+    # GLOBAL & REPLICATION SETTINGS
+    # ==========================================
+    global_grp = parser.add_argument_group("Global Settings")
+    global_grp.add_argument(
+        "--start-seed", type=int, default=42, 
+        help="Initial random seed for the replication sequence."
     )
-    parser.add_argument(
-        "--epochs2",
-        type=int,
-        default=80,
-        help="Количество эпох для генератора траекторий (Stage 2)",
+    global_grp.add_argument(
+        "--num-runs", type=int, default=3, 
+        help="Number of sequential replication pipeline runs."
+    )
+    global_grp.add_argument(
+        "--dataset", type=str, choices=("cifar10n", "cifar100n"), default="cifar100n",
+        help="Target benchmark dataset to train and evaluate on."
+    )
+    global_grp.add_argument(
+        "--output-root", type=str, default="./experiments",
+        help="Root directory where all seed-isolated subfolders will be generated."
     )
 
-    args = parser.parse_args()
+    # ==========================================
+    # STAGE 1: BACKBONE TRAINING SETTINGS
+    # ==========================================
+    stage1_grp = parser.add_argument_group("Stage 1 (Backbone) Hyperparameters")
+    stage1_grp.add_argument(
+        "--stage1-script", type=str, default="train_stage1.py",
+        help="Filename/path of the backbone model training script."
+    )
+    stage1_grp.add_argument(
+        "--lr1", type=float, default=0.1, help="Learning rate for backbone training."
+    )
+    stage1_grp.add_argument(
+        "--epochs1", type=int, default=120, help="Number of epochs for backbone training."
+    )
 
-    # В новой версии проекта скрипты одни и те же для всех датасетов
-    stage1_script = "train_stage1.py"
-    stage2_script = "train_stage2.py"
-    eval_script = "evaluate_ood.py"
+    # ==========================================
+    # STAGE 2: METHOD A - DETERMINISTIC TRAJECTORY
+    # ==========================================
+    traj_grp = parser.add_argument_group("Stage 2 (Method A): Deterministic Trajectory Generator")
+    traj_grp.add_argument(
+        "--traj-script", type=str, default="train_stage2.py",
+        help="Script path to train the deterministic trajectory regression model."
+    )
+    traj_grp.add_argument(
+        "--lr-traj", type=float, default=1e-3, help="Learning rate for trajectory generator."
+    )
+    traj_grp.add_argument(
+        "--epochs-traj", type=int, default=80, help="Epochs for training trajectory generator."
+    )
+    traj_grp.add_argument(
+        "--seq-len", type=int, default=50, help="Trajectory sequence length (e.g., 50 dimensions)."
+    )
+
+    # ==========================================
+    # STAGE 2: METHOD B - PARAMETRIC MLP HEAD
+    # ==========================================
+    mlp_grp = parser.add_argument_group("Stage 2 (Method B): Parametric MLP Head")
+    mlp_grp.add_argument(
+        "--mlp-script", type=str, default="train_stage2_mlp.py",
+        help="Script path to train the parametric MLP OOD classifier."
+    )
+    mlp_grp.add_argument(
+        "--lr-mlp", type=float, default=1e-3, help="Learning rate for MLP classifier."
+    )
+    mlp_grp.add_argument(
+        "--epochs-mlp", type=int, default=40, help="Epochs for training the MLP classifier."
+    )
+
+    # ==========================================
+    # STAGE 2: METHOD C - STOCHASTIC CVAE MODEL
+    # ==========================================
+    cvae_grp = parser.add_argument_group("Stage 2 (Method C): Stochastic Trajectory CVAE")
+    cvae_grp.add_argument(
+        "--cvae-script", type=str, default="train_trajectory_cvae.py",
+        help="Script path to train the variational autoencoder trajectory estimator."
+    )
+    cvae_grp.add_argument(
+        "--lr-cvae", type=float, default=5e-4, help="Learning rate for Trajectory CVAE."
+    )
+    cvae_grp.add_argument(
+        "--epochs-cvae", type=int, default=100, help="Epochs for training Trajectory CVAE."
+    )
+    cvae_grp.add_argument(
+        "--latent-dim", type=int, default=128, help="Latent space dimension for CVAE."
+    )
+
+    # ==========================================
+    # STAGE 3: EVALUATION PROTOCOL
+    # ==========================================
+    eval_grp = parser.add_argument_group("Evaluation Protocol Settings")
+    eval_grp.add_argument(
+        "--eval-script", type=str, default="evaluate.py",
+        help="Filename/path of the scientific evaluation/OOD metrics script."
+    )
+    eval_grp.add_argument(
+        "--eval-batch-size", type=int, default=256, help="Inference batch size during metrics computation."
+    )
+
+    return parser.parse_args()
+
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+
+
+def execute_subprocess(cmd: List[str], env: dict[str, str], stage_name: str) -> None:
+    """Executes a training or evaluation command with stdout streaming and error handling."""
+    logging.info("Executing %s...", stage_name)
+    logging.info("Command: %s", " ".join(cmd))
+    
+    start_time = time.time()
+    # Run subprocess and stream logs directly to console
+    result = subprocess.run(cmd, env=env)
+    elapsed_time = time.time() - start_time
+    
+    if result.returncode != 0:
+        logging.error("❌ %s failed with exit code %d.", stage_name, result.returncode)
+        sys.exit(result.returncode)
+        
+    logging.info("✅ %s completed successfully in %.2f seconds.\n", stage_name, elapsed_time)
+
+
+def main() -> None:
+    configure_logging()
+    args = parse_args()
 
     output_root = Path(args.output_root)
+    
+    # Configure environment to prevent buffered outputs
     env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"  # Чтобы логи выводились сразу, без задержек
+    env["PYTHONUNBUFFERED"] = "1"
 
-    print(f"=== Запуск серии экспериментов для {args.dataset} ===")
-    print(
-        f"Начальный сид: {args.start_seed} | Количество запусков: {args.num_runs}\n"
-    )
+    logging.info("=========================================================================")
+    logging.info("       EXPERIMENTAL PIPELINE ORCHESTRATOR FOR BENCHMARK REPLICABILITY     ")
+    logging.info("=========================================================================")
+    logging.info("Target Dataset:  %s", args.dataset)
+    logging.info("Initial Seed:    %d", args.start_seed)
+    logging.info("Number of Runs:  %d", args.num_runs)
+    logging.info("Output Directory: %s", output_root.resolve())
+    logging.info("=========================================================================\n")
 
     for run_idx in range(args.num_runs):
         current_seed = args.start_seed + run_idx
-        print(
-            f"--- [ЗАПУСК {run_idx + 1}/{args.num_runs}] Используем SEED = {current_seed} ---"
-        )
+        logging.info(">>> RUN [%d/%d] | INITIALIZING EXPERIMENT WITH SEED = %d <<<", run_idx + 1, args.num_runs, current_seed)
 
-        # Создаем изолированные папки под текущий сид
+        # Build seed-isolated directory structure
         run_dir = output_root / f"seed_{current_seed}"
         artifacts_dir = run_dir / "artifacts"
         reports_dir = run_dir / "reports"
@@ -76,76 +179,72 @@ def main():
         artifacts_dir.mkdir(parents=True, exist_ok=True)
         reports_dir.mkdir(parents=True, exist_ok=True)
 
-        # ==========================================
-        # СТЕЙДЖ 1
-        # ==========================================
-        print(f"     Запуск Stage 1 ({stage1_script})...")
+        # --------------------------------------------------
+        # STAGE 1: BACKBONE TRAINING
+        # --------------------------------------------------
         cmd_stage1 = [
-            sys.executable,
-            stage1_script,
-            "--dataset",
-            args.dataset,
-            "--seed",
-            str(current_seed),
-            "--output-dir",
-            str(artifacts_dir),
+            sys.executable, args.stage1_script,
+            "--dataset", args.dataset,
+            "--seed", str(current_seed),
+            "--output-dir", str(artifacts_dir),
+            "--lr", str(args.lr1),
+            "--epochs", str(args.epochs1)
         ]
+        execute_subprocess(cmd_stage1, env, f"Stage 1 [Backbone Training - Seed {current_seed}]")
 
-        res1 = subprocess.run(cmd_stage1, env=env)
-        if res1.returncode != 0:
-            print(f"❌ Ошибка на Stage 1 с сидом {current_seed}. Прерываем серию.")
-            sys.exit(res1.returncode)
-
-        # ==========================================
-        # СТЕЙДЖ 2
-        # ==========================================
-        print(f"     Запуск Stage 2 ({stage2_script})...")
-        cmd_stage2 = [
-            sys.executable,
-            stage2_script,
-            "--dataset",
-            args.dataset,
-            "--seed",
-            str(current_seed),
-            "--artifacts-dir",
-            str(artifacts_dir),
-            "--lr",
-            str(args.lr2),
-            "--epochs",
-            str(args.epochs2),
+        # --------------------------------------------------
+        # STAGE 2 (METHOD A): DETERMINISTIC TRAJECTORY GENERATOR
+        # --------------------------------------------------
+        cmd_traj = [
+            sys.executable, args.traj_script,
+            "--dataset", args.dataset,
+            "--seed", str(current_seed),
+            "--artifacts-dir", str(artifacts_dir),
+            "--lr", str(args.lr_traj),
+            "--epochs", str(args.epochs_traj),
+            "--sequence-length", str(args.seq_len)
         ]
+        execute_subprocess(cmd_traj, env, f"Stage 2-A [Deterministic Trajectory - Seed {current_seed}]")
 
-        res2 = subprocess.run(cmd_stage2, env=env)
-        if res2.returncode != 0:
-            print(f"❌ Ошибка на Stage 2 с сидом {current_seed}. Прерываем серию.")
-            sys.exit(res2.returncode)
+        # --------------------------------------------------
+        # STAGE 2 (METHOD B): PARAMETRIC MLP HEAD
+        # --------------------------------------------------
+        cmd_mlp = [
+            sys.executable, args.mlp_script,
+            "--dataset", args.dataset,
+            "--seed", str(current_seed),
+            "--artifacts-dir", str(artifacts_dir),
+            "--lr", str(args.lr_mlp),
+            "--epochs", str(args.epochs_mlp)
+        ]
+        execute_subprocess(cmd_mlp, env, f"Stage 2-B [Parametric MLP Head - Seed {current_seed}]")
 
-        # ==========================================
-        # ОЦЕНКА
-        # ==========================================
-        print(f"     Запуск Evaluation ({eval_script})...")
+        # --------------------------------------------------
+        # STAGE 2 (METHOD C): STOCHASTIC TRAJECTORY CVAE
+        # --------------------------------------------------
+        cmd_cvae = [
+            sys.executable, args.cvae_script,
+            "--dataset", args.dataset,
+            "--seed", str(current_seed),
+            "--artifacts-dir", str(artifacts_dir),
+            "--lr", str(args.lr_cvae),
+            "--epochs", str(args.epochs_cvae),
+            "--latent-dim", str(args.latent_dim),
+            "--sequence-length", str(args.seq_len)
+        ]
+        execute_subprocess(cmd_cvae, env, f"Stage 2-C [Stochastic Trajectory CVAE - Seed {current_seed}]")
+
+        # --------------------------------------------------
+        # STAGE 3: EVALUATION & METRIC CALCULATION
+        # --------------------------------------------------
         cmd_eval = [
-            sys.executable,
-            eval_script,
-            "--dataset",
-            args.dataset,
-            "--artifacts-dir",
-            str(artifacts_dir),
-            "--reports-dir",
-            str(reports_dir),
+            sys.executable, args.eval_script,
+            "--dataset", args.dataset,
+            "--artifacts-dir", str(artifacts_dir),
+            "--reports-dir", str(reports_dir),
+            "--batch-size", str(args.eval_batch_size),
+            "--trajectory-sequence-length", str(args.seq_len)
         ]
+        execute_subprocess(cmd_eval, env, f"Evaluation Protocol [Seed {current_seed}]")
 
-        res3 = subprocess.run(cmd_eval, env=env)
-        if res3.returncode != 0:
-            print(f"❌ Ошибка при оценке с сидом {current_seed}. Прерываем серию.")
-            sys.exit(res3.returncode)
-
-        print(
-            f"✅ Запуск {run_idx + 1} успешно завершен! Отчет сохранен в: {reports_dir}\n"
-        )
-
-    print("🎉 Все запланированные запуски успешно выполнены!")
-
-
-if __name__ == "__main__":
-    main()
+        logging.info("Run %d completed. Outputs exported to: %s\n", run_idx + 1, run_dir.resolve())

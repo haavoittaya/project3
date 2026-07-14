@@ -91,6 +91,7 @@ def configure_logging() -> None:
 
 
 def compute_margin_batch(logits: torch.Tensor, labels: torch.Tensor) -> np.ndarray:
+    """Computes the confidence margin: Z_y - max(Z_{k != y})."""
     logits_np = logits.detach().cpu().numpy()
     labels_np = labels.detach().cpu().numpy()
     batch_idx = np.arange(logits_np.shape[0])
@@ -113,9 +114,15 @@ def train_stage1(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
     trainset, noise_data = setup_fn(data_root=args.data_root, repo_root=args.repo_root)
     if label_key not in noise_data:
         raise KeyError(f"Label key '{label_key}' not found. Available keys: {list(noise_data.keys())}")
+    
+    # Applying noisy labels to the dataset[cite: 6]
     trainset.targets = np.array(noise_data[label_key]).tolist()
 
-    train_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=False)
+    # METHODOLOGICAL FIX: 
+    # Two loaders: one for shuffled training, one for deterministic tracking.
+    train_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, drop_last=False)
+    track_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=False, drop_last=False)
+    
     num_samples = len(trainset)
     num_classes = int(config["num_classes"])
 
@@ -123,20 +130,20 @@ def train_stage1(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
+    # Initialize history trackers[cite: 6]
     softmax_history = np.zeros((args.epochs, num_samples, num_classes), dtype=np.float32)
     margin_history = np.zeros((args.epochs, num_samples), dtype=np.float32)
 
     logging.info(
         "Stage 1 started: dataset=%s, epochs=%d, samples=%d, label_key=%s",
-        args.dataset,
-        args.epochs,
-        num_samples,
-        label_key,
+        args.dataset, args.epochs, num_samples, label_key
     )
+    
     for epoch in range(args.epochs):
+        # ---------------------------------------------------------
+        # PHASE 1: Training (with Shuffle and Train Mode)
+        # ---------------------------------------------------------
         model.train()
-        sample_idx = 0
-
         for images, labels in train_loader:
             images = images.to(device)
             labels = labels.to(device)
@@ -147,18 +154,35 @@ def train_stage1(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
             loss.backward()
             optimizer.step()
 
-            with torch.no_grad():
-                probs = F.softmax(logits, dim=1).detach().cpu().numpy()
+        # ---------------------------------------------------------
+        # PHASE 2: Tracking Dynamics (No Shuffle, Eval Mode)
+        # ---------------------------------------------------------
+        model.eval()
+        sample_idx = 0
+        with torch.no_grad():
+            for images, labels in track_loader:
+                images = images.to(device)
+                labels = labels.to(device)
+
+                logits = model(images)
+                
+                # Compute dynamics
+                probs = F.softmax(logits, dim=1).cpu().numpy()
                 margins = compute_margin_batch(logits, labels)
+                
                 batch_size = images.size(0)
                 end_idx = sample_idx + batch_size
 
+                # Store sequentially[cite: 6]
                 softmax_history[epoch, sample_idx:end_idx, :] = probs
                 margin_history[epoch, sample_idx:end_idx] = margins
                 sample_idx = end_idx
 
         logging.info("Epoch %d/%d completed", epoch + 1, args.epochs)
 
+    # ---------------------------------------------------------
+    # Save Artifacts
+    # ---------------------------------------------------------
     output_dir = Path(args.output_dir or config["default_output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 

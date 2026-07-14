@@ -10,15 +10,7 @@ import torchvision
 
 
 class LogitNorm(nn.Module):
-    """Normalize logits by their L2 norm and a temperature factor.
-
-    This layer implements the forward transformation:
-
-        y = x / (||x||_2 + eps) / tau
-
-    where the norm is computed over the last dimension.
-    """
-
+    """Normalize logits by their L2 norm and a temperature factor."""
     def __init__(self, tau: float = 1.0, eps: float = 1e-7) -> None:
         super().__init__()
         if tau <= 0:
@@ -27,7 +19,8 @@ class LogitNorm(nn.Module):
         self.eps = float(eps)
 
     def forward(self, logits: torch.Tensor) -> torch.Tensor:
-        norm = torch.norm(logits, p=2, dim=-1, keepdim=True)
+        # Replaced deprecated torch.norm with modern torch.linalg.vector_norm
+        norm = torch.linalg.vector_norm(logits, ord=2, dim=-1, keepdim=True)
         return logits / (norm + self.eps) / self.tau
 
 
@@ -320,16 +313,6 @@ def trajectory_cvae_loss(
     reconstruction_loss: str = "smooth_l1",
     kl_weight: float = 1.0,
 ) -> TrajectoryCVAELossOutput:
-    """Compute a CVAE loss for trajectory generation.
-
-    Args:
-        predicted_trajectory: Model output with shape ``[batch, T, C]``.
-        target_trajectory: Ground-truth trajectory with the same shape.
-        mu: Latent mean from the encoder.
-        logvar: Latent log-variance from the encoder.
-        reconstruction_loss: Either ``"smooth_l1"`` or ``"mse"``.
-        kl_weight: Multiplier for the KL term.
-    """
     if reconstruction_loss == "smooth_l1":
         recon_loss = F.smooth_l1_loss(predicted_trajectory, target_trajectory)
     elif reconstruction_loss == "mse":
@@ -337,7 +320,9 @@ def trajectory_cvae_loss(
     else:
         raise ValueError("reconstruction_loss must be 'smooth_l1' or 'mse'")
 
-    kl_divergence = -0.5 * torch.mean(1.0 + logvar - mu.pow(2) - logvar.exp())
+    # Corrected: Sum over latent dimension (dim=1), then average over batch
+    kl_divergence = -0.5 * torch.mean(torch.sum(1.0 + logvar - mu.pow(2) - logvar.exp(), dim=1))
+    
     total_loss = recon_loss + kl_weight * kl_divergence
     return TrajectoryCVAELossOutput(
         total_loss=total_loss,
