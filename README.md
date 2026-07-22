@@ -1,195 +1,114 @@
-# Distilling Training Dynamics into Inference-Time Uncertainty Descriptors
+================================================================================
+CIFAR-N Training Dynamics & Trajectory Distillation
+================================================================================
 
-This repository implements a two-stage pipeline for distilling training dynamics into lightweight inference-time uncertainty descriptors.
+OVERVIEW
+--------------------------------------------------------------------------------
+This repository provides a comprehensive framework for tracking, distilling, and
+evaluating neural network training dynamics on datasets with noisy labels. By
+analyzing how a model learns over time (training trajectories), the pipeline
+extracts uncertainty descriptors and distills them into lightweight generative
+and parametric models. These distilled models are then used to evaluate sample
+correctness and detect Out-of-Distribution (OOD) data.
 
-## Project Structure
+The project relies on human-annotated noise benchmarks, specifically utilizing
+CIFAR-10N and CIFAR-100N.
 
-- `src/models.py`: network components (ResNet-18 backbone, feature extractor, MLP head)
-- `src/dataset.py`: CIFAR-10/CIFAR-10N data setup and repository bootstrap
-- `train_stage1.py`: trajectory tracking and backbone training
-- `train_stage2.py`: full trajectory distillation with TrajectoryGenerator
-- `train_trajectory_cvae.py`: conditional trajectory generation with a CVAE and logging
-- `evaluate_ood.py`: OOD-centric evaluation across clean ID, noisy ID, near-OOD, and far-OOD groups
-- `train_stage1_cifar100n.py`: CIFAR-100N trajectory tracking and backbone training
-- `train_stage2_cifar100n.py`: CIFAR-100N descriptor distillation
-- `evaluate_ood_cifar100n.py`: CIFAR-100N noisy-label, OOD, and robustness evaluation
 
-## Requirements
+PROJECT ARCHITECTURE
+--------------------------------------------------------------------------------
+The pipeline is divided into distinct stages, moving from initial dynamic
+tracking to feature distillation and comprehensive evaluation.
 
-Install dependencies from `requirements.txt`:
+1. Stage 1: Dynamics Tracking
+   - Script: stage1.py
+   - Functionality: Trains a ResNet-18 backbone on noisy datasets.
+   - Artifacts: Tracks and saves per-sample softmax probabilities
+     (softmax_history) and confidence margins (margin_history) iteratively over
+     the specified training epochs.
 
-```powershell
-pip install -r requirements.txt
-```
+2. Stage 2: Distillation Methods
+   The project provides three distinct methods to distill the extracted Stage 1
+   trajectories into lightweight predictors from frozen deterministic embeddings.
 
-## Data and Artifacts
+   - Method A: Trajectory CVAE (stage2_cvae.py)
+     Trains a Conditional Variational Autoencoder (CVAE) that generates full
+     prediction trajectories conditioned on static feature embeddings to capture
+     uncertainty.
 
-- CIFAR-10 is downloaded automatically via torchvision.
-- CIFAR-10N metadata is downloaded automatically as a single `CIFAR-10_human.pt` file from a fast mirror, instead of cloning the full repository.
-- CIFAR-100N metadata is downloaded automatically as a single `CIFAR-100_human.pt` file from a fast mirror.
-- Stage outputs are saved to `./artifacts` by default.
+   - Method B: 4D MLP Descriptors (stage2_mlp.py)
+     Extracts 4D uncertainty descriptors based on training history: Area Under
+     the Margin (AUM), Mean Confidence, Variability, and Forgetting Count.
+     Trains an Advanced MLP to regress these normalized descriptors directly
+     from image features.
 
-Expected artifacts after full run:
+   - Method C: Trajectory Generator (stage2_trajectory.py)
+     Utilizes a temporal generator with residual MLP blocks to regress the entire
+     continuous trajectory matrix (margin or softmax).
 
-- `artifacts/softmax_history_cifar10n.npy`
-- `artifacts/margin_history_cifar10n.npy`
-- `artifacts/resnet18_backbone.pth`
-- `artifacts/trajectory_generator.pth`
-- `artifacts/X_features_cifar10n.npy`
-- `artifacts/trajectory_targets_cifar10n_margin.npy`
+3. Baseline Predictors
+   - Script: train_baseline_predictor.py
+   - Functionality: Trains a direct, image-only binary predictor using a Binary
+     Cross-Entropy (BCE) loss to classify labels as clean or noisy.
 
-Expected artifacts for CIFAR-100N pipeline (default `./artifacts_cifar100n`):
+4. Unified Evaluation Protocol
+   - Script: eval.py
+   - Tasks Evaluated:
+     * Task 1: Clean ID (Meta-Test) vs. Noisy ID.
+     * Task 2: Clean ID vs. Near-OOD (using CIFAR-10 as OOD for CIFAR-100, and vice versa).
+     * Task 3: Clean ID vs. Far-OOD (using the SVHN dataset).
+   - Baselines Compared: Maximum Softmax Probability (MSP), LogitNorm
+     (Energy Score), Mahalanobis Distance, and the Image-Only Binary Predictor.
+   - Metrics: Computes Risk Coverage (AURC), AUROC, and AUPRC. Results are
+     exported to a unified CSV summary.
 
-- `artifacts_cifar100n/softmax_history_cifar100n.npy`
-- `artifacts_cifar100n/margin_history_cifar100n.npy`
-- `artifacts_cifar100n/resnet18_backbone_cifar100n.pth`
-- `artifacts_cifar100n/trajectory_generator.pth`
-- `artifacts_cifar100n/X_features_cifar100n.npy`
-- `artifacts_cifar100n/trajectory_targets_cifar100n_margin.npy`
 
-## Unified Pipeline (Single Scripts)
+MODELS & COMPONENTS
+--------------------------------------------------------------------------------
+The framework implements several custom neural network architectures:
+- ResNet-18 Backbone: Modified for configurable output classes (10 or 100).
+- FeatureExtractor: Strips the final classification layer from the backbone to
+  yield dense latent embeddings.
+- AdvancedMLP: A customizable Multi-Layer Perceptron used for 4D descriptor
+  regression and baseline binary prediction.
+- TrajectoryGenerator: Projects features into a temporal sequence using 1D
+  convolutions and residual blocks.
+- TrajectoryCVAE: An encoder-decoder architecture that uses reparameterization
+  to generate sequences from a latent space.
+- LogitNorm: A module for normalizing logits by their L2 norm and a
+  temperature factor (tau).
 
-All main scripts now support both datasets via `--dataset`:
 
-- `cifar10n`
-- `cifar100n`
+USAGE INSTRUCTIONS
+--------------------------------------------------------------------------------
+Prerequisites & Data Setup:
+  The datasets (CIFAR-10N and CIFAR-100N) will automatically download their base
+  images via torchvision and retrieve the required human-annotated noise labels
+  (CIFAR-10_human.pt or CIFAR-100_human.pt) from specified repository mirrors.
 
-Stage 1 (CIFAR-10N):
+Running the Pipeline:
+  Execute the stages sequentially to ensure artifacts are properly generated
+  and passed down the pipeline.
 
-```powershell
-python train_stage1.py --dataset cifar10n --epochs 50 --batch-size 256 --lr 0.001 --seed 42
-```
+  1. Run Stage 1 (Backbone & Tracking)
+     python stage1.py --dataset cifar10n --epochs 50 --batch-size 256
 
-Stage 1 (CIFAR-100N):
+  2. Run Stage 2 (Distillation)
+     - To train the 4D Descriptor MLP:
+       python stage2_mlp.py --dataset cifar10n --epochs 40 --batch-size 512
 
-```powershell
-python train_stage1.py --dataset cifar100n --epochs 50 --batch-size 256 --lr 0.001 --seed 42
-```
+     - To train the Trajectory CVAE:
+       python stage2_cvae.py --dataset cifar10n --epochs 50 --batch-size 256
 
-Stage 2 (CIFAR-10N):
+     - To train the Trajectory Generator:
+       python stage2_trajectory.py --dataset cifar10n --epochs 40 --target-type margin
 
-```powershell
-python train_stage2.py --dataset cifar10n --epochs 40 --batch-size 512 --lr 0.005 --seed 42
-```
+  3. Train the Baseline Predictor (Optional)
+     python train_baseline_predictor.py --dataset cifar10n --epochs 30
 
-Stage 2 (CIFAR-100N):
+  4. Run Unified Evaluation
+     python eval.py --dataset cifar10n --batch-size 256 --score-batch-size 256
 
-```powershell
-python train_stage2.py --dataset cifar100n --epochs 40 --batch-size 512 --lr 0.005 --seed 42
-```
-
-Evaluation (CIFAR-10N):
-
-```powershell
-python evaluate_ood.py --dataset cifar10n --batch-size 256
-```
-
-Evaluation (CIFAR-100N):
-
-```powershell
-python evaluate_ood.py --dataset cifar100n --batch-size 256
-```
-
-## Stage 1: Trajectory Tracking
-
-Train the backbone on CIFAR-10N aggregate labels and store trajectory statistics:
-
-```powershell
-python train_stage1.py --epochs 50 --batch-size 256 --lr 0.001 --seed 42
-```
-
-## Stage 2: Trajectory Distillation
-
-Train a trajectory generator to regress the full epoch-wise margin sequence:
-
-```powershell
-python train_stage2.py --epochs 40 --batch-size 512 --lr 0.005 --seed 42
-```
-
-## Trajectory CVAE Generation
-
-Generate full softmax trajectories from frozen embeddings and log reconstruction/KL statistics:
-
-```powershell
-python train_trajectory_cvae.py --dataset cifar100n --epochs 50 --batch-size 256 --lr 0.001 --seed 42
-```
-
-Logged outputs include:
-
-- `trajectory_cvae.pth`
-- `generated_trajectory_preview_<dataset>.npy`
-- `X_features_<dataset>.npy`
-- `trajectory_targets_<dataset>_softmax.npy`
-
-## CIFAR-100N Pipeline
-
-Stage 1 (CIFAR-100N):
-
-```powershell
-python train_stage1_cifar100n.py --epochs 50 --batch-size 256 --lr 0.001 --seed 42
-```
-
-Stage 2 (CIFAR-100N):
-
-```powershell
-python train_stage2_cifar100n.py --epochs 40 --batch-size 512 --lr 0.005 --seed 42
-```
-
-Evaluation (CIFAR-100N):
-
-```powershell
-python evaluate_ood_cifar100n.py --batch-size 256
-```
-
-## OOD-Centric Evaluation
-
-Run the OOD-centric evaluation with:
-
-```powershell
-python evaluate_ood.py --dataset cifar10n --batch-size 256
-python evaluate_ood.py --dataset cifar100n --batch-size 256
-```
-
-The main evaluation script now uses four groups for the selected ID dataset:
-
-- Clean ID: stratified validation split sampled from correctly labeled training samples
-- Noisy ID: noisy training subset with human-flipped labels
-- Near-OOD: CIFAR-100 when ID is CIFAR-10, and CIFAR-10 when ID is CIFAR-100
-- Far-OOD: SVHN test split
-
-It compares four scoring methods:
-
-- Maximum Softmax Probability (MSP)
-- LogitNorm + MSP or Energy
-- Mahalanobis distance
-- Trajectory prediction score from `TrajectoryGenerator`
-
-Evaluation reports AUROC, AUPRC, and AURC for these binary tasks:
-
-- Clean ID vs Noisy ID
-- Clean ID vs Near-OOD
-- Clean ID vs Far-OOD
-
-The script also writes a summary CSV to the reports directory, for example:
-
-- `artifacts/reports/ood_summary_cifar10n.csv`
-- `artifacts_cifar100n/reports/ood_summary_cifar100n.csv`
-
-## Optional Paths
-
-You can override default paths in all scripts:
-
-- `--data-root` for CIFAR-10 data
-- `--repo-root` for local CIFAR-10N repository path
-- `--artifacts-dir` for saved artifacts
-- `--svhn-root` in `evaluate_ood.py`
-- `--reports-dir` in `evaluate_ood.py`
-
-## Evaluation Note
-
-The comparison is intended to assess whether trajectory prediction contributes complementary information relative to standard confidence- and distance-based baselines. It does not assume unconditional superiority of any single method.
-
-## Reproducibility Notes
-
-- All scripts support `--seed` for deterministic random initialization.
-- Device selection is automatic: CUDA if available, otherwise CPU.
+  This will compile the predictive scores across all methods, compare them
+  against OOD datasets, and generate a final benchmarking report in your
+  artifacts directory.
