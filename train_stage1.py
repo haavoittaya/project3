@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import logging
 import random
 from pathlib import Path
@@ -11,10 +12,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 
 from src.dataset import setup_cifar100n, setup_cifar10n
 from src.models import get_resnet18_backbone
+
+# Standard normalization parameters for CIFAR-10 and CIFAR-100
+CIFAR_STATS: Dict[str, Dict[str, Tuple[float, float, float]]] = {
+    "cifar10n": {
+        "mean": (0.4914, 0.4822, 0.4465),
+        "std": (0.2023, 0.1994, 0.2010),
+    },
+    "cifar100n": {
+        "mean": (0.5071, 0.4867, 0.4408),
+        "std": (0.2675, 0.2565, 0.2761),
+    },
+}
 
 DATASET_CONFIG: Dict[str, Dict[str, Any]] = {
     "cifar10n": {
@@ -90,6 +104,25 @@ def configure_logging() -> None:
     )
 
 
+def get_transforms(dataset_name: str) -> Tuple[transforms.Compose, transforms.Compose]:
+    """Return augmented transform for training and deterministic transform for tracking."""
+    stats = CIFAR_STATS.get(dataset_name, CIFAR_STATS["cifar10n"])
+    
+    train_transform = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=stats["mean"], std=stats["std"]),
+    ])
+    
+    eval_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=stats["mean"], std=stats["std"]),
+    ])
+    
+    return train_transform, eval_transform
+
+
 def compute_margin_batch(logits: torch.Tensor, labels: torch.Tensor) -> np.ndarray:
     """Computes the confidence margin: Z_y - max(Z_{k != y})."""
     logits_np = logits.detach().cpu().numpy()
@@ -111,17 +144,27 @@ def train_stage1(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
     label_key = args.label_key or config["default_label_key"]
     setup_fn = config["setup_fn"]
 
-    trainset, noise_data = setup_fn(data_root=args.data_root, repo_root=args.repo_root)
+    # Generate appropriate transforms for the chosen dataset
+    train_transform, eval_transform = get_transforms(args.dataset)
+
+    # Pass augmented transform when creating dataset[cite: 1]
+    trainset, noise_data = setup_fn(
+        data_root=args.data_root, 
+        repo_root=args.repo_root,
+        transform=train_transform
+    )
     if label_key not in noise_data:
         raise KeyError(f"Label key '{label_key}' not found. Available keys: {list(noise_data.keys())}")
     
-    # Applying noisy labels to the dataset[cite: 6]
+    # Applying noisy labels to the dataset[cite: 4]
     trainset.targets = np.array(noise_data[label_key]).tolist()
 
-    # METHODOLOGICAL FIX: 
-    # Two loaders: one for shuffled training, one for deterministic tracking.
+    # METHODOLOGICAL FIX: Create a shallow copy of dataset for tracking with deterministic transform[cite: 1, 4]
+    trackset = copy.copy(trainset)
+    trackset.transform = eval_transform
+
     train_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, drop_last=False)
-    track_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=False, drop_last=False)
+    track_loader = DataLoader(trackset, batch_size=args.batch_size, shuffle=False, drop_last=False)
     
     num_samples = len(trainset)
     num_classes = int(config["num_classes"])
@@ -130,7 +173,7 @@ def train_stage1(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-    # Initialize history trackers[cite: 6]
+    # Initialize history trackers[cite: 4]
     softmax_history = np.zeros((args.epochs, num_samples, num_classes), dtype=np.float32)
     margin_history = np.zeros((args.epochs, num_samples), dtype=np.float32)
 
@@ -173,7 +216,7 @@ def train_stage1(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
                 batch_size = images.size(0)
                 end_idx = sample_idx + batch_size
 
-                # Store sequentially[cite: 6]
+                # Store sequentially[cite: 4]
                 softmax_history[epoch, sample_idx:end_idx, :] = probs
                 margin_history[epoch, sample_idx:end_idx] = margins
                 sample_idx = end_idx

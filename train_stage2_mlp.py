@@ -49,6 +49,18 @@ DATASET_CONFIG: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# Normalization statistics copied from stage1.py to ensure consistent feature extraction
+CIFAR_STATS = {
+    "cifar10n": {
+        "mean": (0.4914, 0.4822, 0.4465),
+        "std": (0.2023, 0.1994, 0.2010),
+    },
+    "cifar100n": {
+        "mean": (0.4914, 0.4822, 0.4465),
+        "std": (0.2023, 0.1994, 0.2010),
+    },
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -70,7 +82,7 @@ def parse_args() -> argparse.Namespace:
 
 def configure_logging() -> None:
     logging.basicConfig(
-        level=logging.INFO, 
+        level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s"
     )
 
@@ -84,8 +96,8 @@ def set_seed(seed: int) -> None:
 
 
 def compute_4d_descriptors(
-    softmax_history: np.ndarray, 
-    margin_history: np.ndarray, 
+    softmax_history: np.ndarray,
+    margin_history: np.ndarray,
     noisy_labels: np.ndarray
 ) -> np.ndarray:
     """
@@ -94,23 +106,23 @@ def compute_4d_descriptors(
     """
     if softmax_history.ndim != 3 or margin_history.ndim != 2:
         raise ValueError("Invalid history dimensions. Expected Softmax: [T, N, C], Margin: [T, N].")
-        
+
     T, N, C = softmax_history.shape
-    
+
     if margin_history.shape[1] != N or noisy_labels.shape[0] != N:
         raise ValueError("Sample dimension mismatch between artifacts and dataset labels.")
-    
+
     # 1. AUM (Area Under the Margin)[cite: 8]
     aum = np.mean(margin_history, axis=0)
-    
+
     # 2. Mean Confidence (over the assigned noisy labels)[cite: 8]
     sample_indices = np.arange(N)
     true_probs = softmax_history[:, sample_indices, noisy_labels]
     mean_conf = np.mean(true_probs, axis=0)
-    
+
     # 3. Variability (Standard deviation of confidences)[cite: 8]
     variability = np.std(true_probs, axis=0)
-    
+
     # 4. Forgetting Count (Margin transitions from > 0 to <= 0)[cite: 8]
     learned = margin_history > 0
     forgetting_count = np.sum((learned[:-1, :] == True) & (learned[1:, :] == False), axis=0)
@@ -121,15 +133,15 @@ def compute_4d_descriptors(
 
 
 def extract_features(
-    trainset: Any, 
-    backbone_path: Path, 
-    num_classes: int, 
+    trainset: Any,
+    backbone_path: Path,
+    num_classes: int,
     device: torch.device
 ) -> np.ndarray:
     """
     Extracts deep features from the backbone network.
-    METHODOLOGICAL FIX: Temporarily overrides dataset transforms to guarantee 
-    deterministic, non-augmented feature extraction.
+    Uses the dataset's transform (which must include proper normalization)
+    to ensure consistency with backbone training.
     """
     backbone = get_resnet18_backbone(num_classes=num_classes)
     backbone.load_state_dict(torch.load(backbone_path, map_location=device, weights_only=True))
@@ -139,26 +151,17 @@ def extract_features(
     extractor = FeatureExtractor(backbone).to(device)
     extractor.eval()
 
-    # METHODOLOGICAL FIX: Clean deterministic transform override
-    original_transform = getattr(trainset, "transform", None)
-    trainset.transform = transforms.Compose([
-        transforms.ToTensor(),
-    ])
-
+    # Use the dataset's own transform (already includes normalization)
     extract_loader = DataLoader(
         trainset, batch_size=256, shuffle=False, num_workers=4, pin_memory=(device.type == "cuda")
     )
     features_list = []
 
-    logging.info("Extracting deterministic features from training images...")
+    logging.info("Extracting deterministic features from training images (with normalization)...")
     with torch.no_grad():
         for images, _ in extract_loader:
             features = extractor(images.to(device))
             features_list.append(features.cpu().numpy())
-
-    # Restore original augmentations
-    if original_transform is not None:
-        trainset.transform = original_transform
 
     return np.concatenate(features_list, axis=0).astype(np.float32)
 
@@ -185,19 +188,59 @@ def train_stage2_mlp(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
     margin_history = np.load(margin_path)
     softmax_history = np.load(softmax_path)
 
-    trainset, noise_data = setup_fn(data_root=args.data_root, repo_root=args.repo_root)
+    # Build the evaluation transform with proper normalization for feature extraction
+    stats = CIFAR_STATS.get(args.dataset, CIFAR_STATS["cifar10n"])
+    eval_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=stats["mean"], std=stats["std"]),
+    ])
+
+    # Load dataset with the correct deterministic transform
+    trainset, noise_data = setup_fn(
+        data_root=args.data_root,
+        repo_root=args.repo_root,
+        transform=eval_transform
+    )
+
     noisy_labels = np.array(noise_data[label_key]).astype(np.int64)
 
     # 1. Compute 4D regression targets strictly[cite: 8]
     descriptors = compute_4d_descriptors(softmax_history, margin_history, noisy_labels)
-    
+
+    # ---- Normalize descriptors and save statistics ----
+    desc_mean = descriptors.mean(axis=0)
+    desc_std = descriptors.std(axis=0)
+    desc_std[desc_std == 0] = 1.0  # avoid division by zero
+    descriptors_normalized = (descriptors - desc_mean) / desc_std
+
+    # Save statistics for evaluation use
+    stats_path = artifacts_dir / "descriptors_stats.npz"
+    np.savez(stats_path, mean=desc_mean, std=desc_std)
+    logging.info("Descriptor normalization stats saved to %s", stats_path)
+    # ----------------------------------------------------------------
+
     # 2. Extract aligned deterministic features[cite: 8]
     feature_matrix = extract_features(trainset, backbone_path, int(config["num_classes"]), device)
-    
+
     if feature_matrix.shape[0] != descriptors.shape[0]:
         raise ValueError("Mismatch between number of extracted features and descriptor targets.")
-    
-    dataset = TensorDataset(torch.from_numpy(feature_matrix), torch.from_numpy(descriptors))
+
+    # ======================================================================
+    # Use only meta_train_indices (50% of data) to prevent data leakage
+    # when comparing with baseline.
+    # ======================================================================
+    rng = np.random.default_rng(42)
+    indices = np.arange(len(trainset))
+    rng.shuffle(indices)
+    split_point = int(len(indices) * 0.5)
+    meta_train_indices = indices[:split_point]
+
+    feature_matrix = feature_matrix[meta_train_indices]
+    descriptors_normalized = descriptors_normalized[meta_train_indices]
+    # ======================================================================
+
+    # Use normalized descriptors as targets
+    dataset = TensorDataset(torch.from_numpy(feature_matrix), torch.from_numpy(descriptors_normalized))
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=False)
 
     # 3. Model Initialization (4D output) & Loss Setup[cite: 8]
@@ -205,15 +248,16 @@ def train_stage2_mlp(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
     criterion = nn.HuberLoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-    logging.info("Stage 2 MLP started: dataset=%s, epochs=%d, target_dim=4", args.dataset, args.epochs)
-    
+    logging.info("Stage 2 MLP started: dataset=%s, epochs=%d, target_dim=4, train_samples=%d",
+                 args.dataset, args.epochs, len(meta_train_indices))
+
     for epoch in range(args.epochs):
         model.train()
         epoch_loss = 0.0
 
         for batch_x, batch_y in loader:
             batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-            
+
             optimizer.zero_grad(set_to_none=True)
             predictions = model(batch_x)
             loss = criterion(predictions, batch_y)
@@ -226,14 +270,14 @@ def train_stage2_mlp(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
         logging.info("Epoch %d/%d | loss=%.6f", epoch + 1, args.epochs, avg_loss)
 
     artifacts_dir.mkdir(parents=True, exist_ok=True)
-    
+
     mlp_path = artifacts_dir / str(config["mlp_file"])
     features_path = artifacts_dir / str(config["features_file"])
     targets_path = artifacts_dir / str(config["targets_file"])
 
     torch.save(model.state_dict(), mlp_path)
     np.save(features_path, feature_matrix)
-    np.save(targets_path, descriptors)
+    np.save(targets_path, descriptors_normalized)   # save normalized targets
 
     logging.info("Stage 2 MLP artifacts saved to %s", artifacts_dir.resolve())
     return mlp_path, features_path, targets_path

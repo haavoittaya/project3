@@ -19,26 +19,21 @@ class LogitNorm(nn.Module):
         self.eps = float(eps)
 
     def forward(self, logits: torch.Tensor) -> torch.Tensor:
-        # Replaced deprecated torch.norm with modern torch.linalg.vector_norm
         norm = torch.linalg.vector_norm(logits, ord=2, dim=-1, keepdim=True)
         return logits / (norm + self.eps) / self.tau
 
 
 def apply_logit_norm(logits: torch.Tensor, tau: float = 1.0, eps: float = 1e-7) -> torch.Tensor:
-    """Functional LogitNorm helper for use in training or evaluation code."""
     return LogitNorm(tau=tau, eps=eps)(logits)
 
 
 def get_resnet18_backbone(num_classes: int = 10) -> nn.Module:
-    """Construct a ResNet-18 backbone with a configurable classifier head."""
     model = torchvision.models.resnet18(weights=None)
     model.fc = nn.Linear(model.fc.in_features, num_classes)
     return model
 
 
 class FeatureExtractor(nn.Module):
-    """Wrap a classification backbone and expose the penultimate embedding."""
-
     def __init__(self, original_model: nn.Module) -> None:
         super().__init__()
         self.features = nn.Sequential(*list(original_model.children())[:-1])
@@ -49,8 +44,6 @@ class FeatureExtractor(nn.Module):
 
 
 class ResidualMLPBlock(nn.Module):
-    """Small residual MLP block used by the trajectory generator."""
-
     def __init__(self, hidden_dim: int, dropout: float = 0.1) -> None:
         super().__init__()
         self.block = nn.Sequential(
@@ -67,8 +60,6 @@ class ResidualMLPBlock(nn.Module):
 
 
 class AdvancedMLP(nn.Module):
-    """Compact MLP head for 4D descriptor distillation."""
-
     def __init__(self, input_dim: int = 512, output_dim: int = 4, hidden_dim: int = 256, dropout: float = 0.2) -> None:
         super().__init__()
         self.network = nn.Sequential(
@@ -87,13 +78,6 @@ class AdvancedMLP(nn.Module):
 
 
 class TrajectoryGenerator(nn.Module):
-    """Predict a continuous trajectory over training epochs from a static embedding.
-
-    The module maps a 512-dimensional representation to a sequence of length
-    ``sequence_length``. It uses a shared MLP trunk followed by a temporal 1D CNN
-    head to model smooth epoch-wise dynamics.
-    """
-
     def __init__(
         self,
         input_dim: int = 512,
@@ -155,8 +139,6 @@ class TrajectoryGenerator(nn.Module):
 
 @dataclass
 class TrajectoryCVAEResult:
-    """Container returned by the trajectory CVAE forward pass."""
-
     generated_trajectory: torch.Tensor
     mu: torch.Tensor
     logvar: torch.Tensor
@@ -164,13 +146,6 @@ class TrajectoryCVAEResult:
 
 
 class TrajectoryCVAE(nn.Module):
-    """Conditional VAE that generates the full prediction trajectory from static features.
-
-    The model conditions on frozen backbone embeddings of shape ``[batch, input_dim]``
-    and reconstructs a sequence of prediction vectors with shape
-    ``[batch, sequence_length, num_classes]``.
-    """
-
     def __init__(
         self,
         input_dim: int = 512,
@@ -179,7 +154,7 @@ class TrajectoryCVAE(nn.Module):
         latent_dim: int = 128,
         hidden_dim: int = 512,
         dropout: float = 0.1,
-        output_activation: str = "softmax",
+        output_activation: str = "none",  # Default to "none" for regression tasks.
     ) -> None:
         super().__init__()
         if input_dim <= 0:
@@ -226,7 +201,6 @@ class TrajectoryCVAE(nn.Module):
         )
 
     def encode(self, features: torch.Tensor, trajectory: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Encode the conditional input and trajectory into the latent posterior."""
         if features.ndim != 2:
             raise ValueError("features must have shape [batch, input_dim]")
         if trajectory.ndim != 3:
@@ -240,13 +214,11 @@ class TrajectoryCVAE(nn.Module):
         return mu, logvar
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        """Sample from the latent posterior using the reparameterization trick."""
         std = torch.exp(0.5 * logvar)
         epsilon = torch.randn_like(std)
         return mu + epsilon * std
 
     def decode(self, features: torch.Tensor, latent: torch.Tensor) -> torch.Tensor:
-        """Decode a latent sample into a full trajectory."""
         if features.ndim != 2:
             raise ValueError("features must have shape [batch, input_dim]")
         if latent.ndim != 2:
@@ -264,15 +236,6 @@ class TrajectoryCVAE(nn.Module):
         features: torch.Tensor,
         trajectory: Optional[torch.Tensor] = None,
     ) -> TrajectoryCVAEResult:
-        """Run the conditional VAE.
-
-        Args:
-            features: Frozen embeddings with shape ``[batch, input_dim]``.
-            trajectory: Optional ground-truth trajectory used during training.
-
-        Returns:
-            A :class:`TrajectoryCVAEResult` with generated trajectory and latent stats.
-        """
         if trajectory is not None:
             mu, logvar = self.encode(features, trajectory)
             latent = self.reparameterize(mu, logvar)
@@ -291,14 +254,11 @@ class TrajectoryCVAE(nn.Module):
         )
 
     def generate(self, features: torch.Tensor) -> torch.Tensor:
-        """Generate a trajectory from features only."""
         return self.forward(features, trajectory=None).generated_trajectory
 
 
 @dataclass
 class TrajectoryCVAELossOutput:
-    """Loss components for trajectory CVAE training."""
-
     total_loss: torch.Tensor
     reconstruction_loss: torch.Tensor
     kl_divergence: torch.Tensor
@@ -320,9 +280,7 @@ def trajectory_cvae_loss(
     else:
         raise ValueError("reconstruction_loss must be 'smooth_l1' or 'mse'")
 
-    # Corrected: Sum over latent dimension (dim=1), then average over batch
     kl_divergence = -0.5 * torch.mean(torch.sum(1.0 + logvar - mu.pow(2) - logvar.exp(), dim=1))
-    
     total_loss = recon_loss + kl_weight * kl_divergence
     return TrajectoryCVAELossOutput(
         total_loss=total_loss,

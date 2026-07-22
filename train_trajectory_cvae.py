@@ -1,5 +1,5 @@
 """
-Stage 2: Train a Conditional Variational Autoencoder (CVAE) to generate 
+Stage 2: Train a Conditional Variational Autoencoder (CVAE) to generate
 full prediction trajectories from frozen deterministic embeddings.
 This script ensures zero-leakage deterministic conditioning for CVAE training.
 """
@@ -24,10 +24,10 @@ from src.models import FeatureExtractor, TrajectoryCVAE, get_resnet18_backbone, 
 # Configuration metadata dictionary matching Stage 1 tracking artifacts
 DATASET_CONFIG: Dict[str, Dict[str, Any]] = {
     "cifar10n": {
-        "num_classes": 10,  
+        "num_classes": 10,
         "default_label_key": "aggre_label",
         "default_artifacts_dir": "./artifacts",
-        "history_file": "margin_history_cifar10n.npy",  
+        "history_file": "margin_history_cifar10n.npy",
         "backbone_file": "resnet18_backbone.pth",
         "trajectory_cvae_file": "trajectory_cvae.pth",
         "features_file": "X_features_cifar10n.npy",
@@ -35,15 +35,27 @@ DATASET_CONFIG: Dict[str, Dict[str, Any]] = {
         "setup_fn": setup_cifar10n,
     },
     "cifar100n": {
-        "num_classes": 100,  
+        "num_classes": 100,
         "default_label_key": "noisy_label",
         "default_artifacts_dir": "./artifacts_cifar100n",
-        "history_file": "margin_history_cifar100n.npy",  
+        "history_file": "margin_history_cifar100n.npy",
         "backbone_file": "resnet18_backbone_cifar100n.pth",
         "trajectory_cvae_file": "trajectory_cvae.pth",
         "features_file": "X_features_cifar100n.npy",
         "targets_file": "trajectory_targets_cifar100n_margin.npy",
         "setup_fn": setup_cifar100n,
+    },
+}
+
+# Normalization statistics copied from stage1.py to ensure consistent feature extraction
+CIFAR_STATS = {
+    "cifar10n": {
+        "mean": (0.4914, 0.4822, 0.4465),
+        "std": (0.2023, 0.1994, 0.2010),
+    },
+    "cifar100n": {
+        "mean": (0.4914, 0.4822, 0.4465),
+        "std": (0.2023, 0.1994, 0.2010),
     },
 }
 
@@ -100,7 +112,6 @@ def parse_args() -> argparse.Namespace:
         default=0.1,
         help="Dropout rate inside the CVAE.",
     )
-    # ИСПРАВЛЕНО: Добавлен аргумент для согласования с оркестратором run_experiments.py
     parser.add_argument(
         "--sequence-length",
         type=int,
@@ -110,7 +121,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--kl-weight",
         type=float,
-        default=0.01,  
+        default=0.01,
         help="KL regularization weight to prevent posterior collapse.",
     )
     parser.add_argument(
@@ -156,8 +167,8 @@ def load_trajectory_targets(history: np.ndarray) -> np.ndarray:
 def extract_features(trainset: Any, backbone_path: Path, num_classes: int, device: torch.device) -> np.ndarray:
     """
     Extracts high-dimensional latent embeddings from the frozen backbone.
-    METHODOLOGICAL FIX: Disables stochastic transformations temporarily to enforce 
-    deterministic feature representation.
+    Uses the dataset's transform (which must include proper normalization)
+    to ensure consistency with backbone training.
     """
     backbone = get_resnet18_backbone(num_classes=num_classes)
     backbone.load_state_dict(torch.load(backbone_path, map_location=device, weights_only=True))
@@ -167,30 +178,21 @@ def extract_features(trainset: Any, backbone_path: Path, num_classes: int, devic
     extractor = FeatureExtractor(backbone).to(device)
     extractor.eval()
 
-    # Overwrite dynamic transform to secure strict, deterministic feature representation
-    original_transform = getattr(trainset, "transform", None)
-    trainset.transform = transforms.Compose([
-        transforms.ToTensor(),
-    ])
-
+    # Use the dataset's own transform (already includes normalization)
     loader = DataLoader(
-        trainset, 
-        batch_size=256, 
-        shuffle=False, 
-        num_workers=4, 
+        trainset,
+        batch_size=256,
+        shuffle=False,
+        num_workers=4,
         pin_memory=(device.type == "cuda")
     )
     features_list = []
 
-    logging.info("Extracting deterministic features for CVAE conditioning...")
+    logging.info("Extracting deterministic features for CVAE conditioning (with normalization)...")
     with torch.no_grad():
         for images, _ in loader:
             embeddings = extractor(images.to(device))
             features_list.append(embeddings.cpu().numpy())
-
-    # Safely restore original training transform augmentations
-    if original_transform is not None:
-        trainset.transform = original_transform
 
     return np.concatenate(features_list, axis=0).astype(np.float32)
 
@@ -235,7 +237,20 @@ def train_trajectory_cvae(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
             f"{history_path}, {backbone_path}"
         )
 
-    trainset, noise_data = setup_fn(data_root=args.data_root, repo_root=args.repo_root)
+    # Build the evaluation transform with proper normalization for feature extraction
+    stats = CIFAR_STATS.get(args.dataset, CIFAR_STATS["cifar10n"])
+    eval_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=stats["mean"], std=stats["std"]),
+    ])
+
+    # Load dataset with the correct deterministic transform
+    trainset, noise_data = setup_fn(
+        data_root=args.data_root,
+        repo_root=args.repo_root,
+        transform=eval_transform
+    )
+
     if label_key not in noise_data:
         raise KeyError(f"Label key '{label_key}' not found. Available keys: {list(noise_data.keys())}")
 
@@ -262,28 +277,45 @@ def train_trajectory_cvae(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
             f"Feature count {feature_matrix.shape[0]} does not match target count {trajectory_targets.shape[0]}."
         )
 
+    # ======================================================================
+    # Use only meta_train_indices (50% of data) to prevent data leakage
+    # when comparing with baseline.
+    # ======================================================================
+    rng = np.random.default_rng(42)
+    indices = np.arange(len(trainset))
+    rng.shuffle(indices)
+    split_point = int(len(indices) * 0.5)
+    meta_train_indices = indices[:split_point]
+
+    feature_matrix = feature_matrix[meta_train_indices]
+    trajectory_targets = trajectory_targets[meta_train_indices]
+    # ======================================================================
+
     dataset = TensorDataset(torch.from_numpy(feature_matrix), torch.from_numpy(trajectory_targets))
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=False)
 
+    # Explicitly set output_activation="none" for margin regression
     generator = TrajectoryCVAE(
         input_dim=feature_matrix.shape[1],
-        sequence_length=actual_seq_len,  
+        sequence_length=actual_seq_len,
         num_classes=trajectory_targets.shape[2],
         latent_dim=args.latent_dim,
         hidden_dim=args.hidden_dim,
         dropout=args.dropout,
+        output_activation="none",
     ).to(device)
 
     optimizer = optim.Adam(generator.parameters(), lr=args.lr)
 
     logging.info(
-        "Trajectory CVAE started on MARGINS: dataset=%s, epochs=%d, samples=%d, sequence_length=%d, target_dim=%d, label_key=%s",
+        "Trajectory CVAE started on MARGINS: dataset=%s, epochs=%d, samples=%d, sequence_length=%d, target_dim=%d, label_key=%s, train_samples=%d",
         args.dataset,
         args.epochs,
         trajectory_targets.shape[0],
         actual_seq_len,
         trajectory_targets.shape[2],
         label_key,
+        len(meta_train_indices)
     )
 
     probe_features = torch.from_numpy(feature_matrix[: min(8, feature_matrix.shape[0])])
@@ -299,7 +331,7 @@ def train_trajectory_cvae(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
 
             optimizer.zero_grad(set_to_none=True)
             output = generator(batch_features, batch_targets)
-            
+
             loss_output = trajectory_cvae_loss(
                 output.generated_trajectory,
                 batch_targets,
@@ -340,6 +372,7 @@ def train_trajectory_cvae(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
     generator.eval()
     with torch.no_grad():
         preview = generator.generate(probe_features.to(device)).cpu().numpy()
+        preview = preview.squeeze(-1)  # Remove the singleton channel dimension (num_classes=1)
     np.save(generated_preview_path, preview)
 
     logging.info("Trajectory CVAE saved to %s", cvae_path)

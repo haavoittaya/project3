@@ -50,6 +50,18 @@ DATASET_CONFIG: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# Normalization statistics copied from stage1.py to ensure consistent feature extraction
+CIFAR_STATS = {
+    "cifar10n": {
+        "mean": (0.4914, 0.4822, 0.4465),
+        "std": (0.2023, 0.1994, 0.2010),
+    },
+    "cifar100n": {
+        "mean": (0.4914, 0.4822, 0.4465),
+        "std": (0.2023, 0.1994, 0.2010),
+    },
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -168,8 +180,8 @@ def extract_features(
 ) -> np.ndarray:
     """
     Extracts deep features from the backbone network.
-    METHODOLOGICAL FIX: Temporarily overrides dataset transforms to guarantee 
-    deterministic, non-augmented feature extraction.
+    Uses the dataset's transform (which must include proper normalization)
+    to ensure consistency with backbone training.
     """
     # 1. Initialize evaluation-grade backbone[cite: 7]
     backbone = get_resnet18_backbone(num_classes=num_classes)
@@ -180,27 +192,17 @@ def extract_features(
     extractor = FeatureExtractor(backbone).to(device)
     extractor.eval()
 
-    # 2. METHODOLOGICAL FIX: Clean deterministic transform override
-    original_transform = getattr(trainset, "transform", None)
-    trainset.transform = transforms.Compose([
-        transforms.ToTensor(),
-        # Add normalizations here if they were used during training
-    ])
-
+    # Use the dataset's own transform (already includes normalization)
     extract_loader = DataLoader(
         trainset, batch_size=256, shuffle=False, num_workers=4, pin_memory=(device.type == "cuda")
     )
     features_list = []
 
-    logging.info("Extracting deterministic features from training images...")
+    logging.info("Extracting deterministic features from training images (with normalization)...")
     with torch.no_grad():
         for images, _ in extract_loader:
             features = extractor(images.to(device))
             features_list.append(features.cpu().numpy())
-
-    # Restore original augmentations for dataset integrity
-    if original_transform is not None:
-        trainset.transform = original_transform
 
     return np.concatenate(features_list, axis=0).astype(np.float32)
 
@@ -228,7 +230,20 @@ def train_stage2(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
     margin_history = np.load(margin_path)
     softmax_history = np.load(softmax_path)
 
-    trainset, noise_data = setup_fn(data_root=args.data_root, repo_root=args.repo_root)
+    # Build the evaluation transform with proper normalization for feature extraction
+    stats = CIFAR_STATS.get(args.dataset, CIFAR_STATS["cifar10n"])
+    eval_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=stats["mean"], std=stats["std"]),
+    ])
+
+    # Load dataset with the correct deterministic transform
+    trainset, noise_data = setup_fn(
+        data_root=args.data_root,
+        repo_root=args.repo_root,
+        transform=eval_transform
+    )
+
     if label_key not in noise_data:
         raise KeyError(f"Label key '{label_key}' not found. Available keys: {list(noise_data.keys())}")
     noisy_labels = np.array(noise_data[label_key]).astype(np.int64)
@@ -244,12 +259,26 @@ def train_stage2(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
             "Check stage-1 epoch count or sequence_length config."
         )
 
-    # METHODOLOGICAL FIX: Extract features without random crop/flip noise[cite: 7]
+    # Extract features using the backbone and the correctly normalized dataset
     feature_matrix = extract_features(trainset, backbone_path, int(config["num_classes"]), device)
     if feature_matrix.shape[0] != trajectory_targets.shape[0]:
         raise ValueError(
             f"Feature count {feature_matrix.shape[0]} does not match trajectory target count {trajectory_targets.shape[0]}."
         )
+
+    # ======================================================================
+    # Use only meta_train_indices (50% of data) to prevent data leakage
+    # when comparing with baseline.
+    # ======================================================================
+    rng = np.random.default_rng(42)
+    indices = np.arange(len(trainset))
+    rng.shuffle(indices)
+    split_point = int(len(indices) * 0.5)
+    meta_train_indices = indices[:split_point]
+
+    feature_matrix = feature_matrix[meta_train_indices]
+    trajectory_targets = trajectory_targets[meta_train_indices]
+    # ======================================================================
 
     # Setup the regression dataset[cite: 7]
     trajectory_dataset = TensorDataset(
@@ -276,8 +305,8 @@ def train_stage2(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
     optimizer = optim.Adam(generator.parameters(), lr=args.lr)
 
     logging.info(
-        "Stage 2 started: dataset=%s, epochs=%d, target_type=%s, label_key=%s, sequence_length=%d",
-        args.dataset, args.epochs, args.target_type, label_key, args.sequence_length,
+        "Stage 2 started: dataset=%s, epochs=%d, target_type=%s, label_key=%s, sequence_length=%d, train_samples=%d",
+        args.dataset, args.epochs, args.target_type, label_key, args.sequence_length, len(meta_train_indices)
     )
     
     # Start regression distillation training[cite: 7]
